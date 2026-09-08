@@ -194,6 +194,9 @@ func (c *Client) GetMargin(order MarginRequest) (*MarginResponse, error) {
 		return nil, fmt.Errorf("margin: decode: %w (body=%.200s)", err, string(resp))
 	}
 	if result.Status != "success" {
+		// R-242: MarginResponse carries no Message/ErrorCode field of its
+		// own — apiError re-parses the raw body so the server's error
+		// detail survives instead of a bare status string.
 		return nil, apiError("margin", result.Status, resp)
 	}
 

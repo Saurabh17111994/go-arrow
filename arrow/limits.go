@@ -41,6 +41,8 @@ func (c *Client) GetLimits() (*Limits, error) {
 	}
 
 	if result.Status != "success" {
+		// R-241: the old error discarded the API status — apiError surfaces
+		// status + code + message like GetMargin/GetUserDetails do.
 		return nil, apiError("trading limits", result.Status, resp)
 	}
 
