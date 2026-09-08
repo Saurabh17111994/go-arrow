@@ -100,8 +100,13 @@ func (s *HFTDataStream) decodeHFTPayload(payload []byte) ([]byte, error) {
 	if s == nil || !s.zstd || s.zdec == nil {
 		return payload, nil
 	}
-	s.zdecMu.RLock()
-	defer s.zdecMu.RUnlock()
+	// P1-037: exclusive Lock — klauspost/compress zstd.Decoder is documented
+	// NOT safe for concurrent use, so two concurrent ReadHFT loops (or any
+	// concurrent decodeHFTPayload callers) must serialize decodes. The
+	// single-reader guard in ReadHFTWithFrame normally prevents this; the
+	// exclusive lock is defense-in-depth for direct decode callers.
+	s.zdecMu.Lock()
+	defer s.zdecMu.Unlock()
 	if s.zdec == nil {
 		return payload, nil
 	}
@@ -111,6 +116,14 @@ func (s *HFTDataStream) decodeHFTPayload(payload []byte) ([]byte, error) {
 // hftPacketMeta inspects the next frame in payload. Response frames use a 4-byte
 // uint32 size (540) with pkt_type at offset 4; LTP/full ticks use int16 size with
 // pkt_type at offset 2.
+//
+// P1-176: meta only returns ok=true when the FULL frame is present (len >=
+// size constant + type byte matches), so the len(payload)<n branch in
+// dispatchHFTPayload fires only for a mid-buffer truncation — e.g. two frames
+// where the first is complete and the second is cut short. A leading
+// truncated tail (10–20 bytes, no complete frame) reports "unknown packet",
+// not "incomplete frame": the 2-byte size prefix alone cannot distinguish a
+// corrupt size from a cut frame, so unknown-packet is the honest signal there.
 func hftPacketMeta(payload []byte) (size int, pktType uint8, ok bool) {
 	if len(payload) >= hftSizeResponse &&
 		binary.LittleEndian.Uint32(payload[0:4]) == uint32(hftSizeResponse) &&
@@ -524,9 +537,9 @@ func decodeU16Slice5(b []byte) []uint16 {
 // E_INVALID_JSON, E_MISSING_FIELD, E_INVALID_PARAM, E_PARSE_ERROR (see Arrow WebSocket HFT documentation).
 // These strings are unrelated to REST historical errors (e.g. BadRequestError / invalid token on GET /candle/...).
 type HFTResponsePacket struct {
-	FrameSize      int16 // LE int16 at wire bytes 0–1 (expected 540 for a full response frame)
-	PktType        uint8 // wire byte 2 (99)
-	ExchSeg        uint8 // wire byte 3
+	FrameSize      int16 // LE u32 size at wire bytes 0–3 (expected 540 for a full response frame; see hftPacketMeta)
+	PktType        uint8 // wire byte 4 (99) — response frames use a 4-byte size prefix, unlike LTP/full (u16 size, type at byte 2)
+	ExchSeg        uint8 // wire byte 5
 	ErrorCode      string
 	ErrorMsg       string
 	RequestType    uint8 // 0=sub, 1=unsub (wire byte 534)
@@ -547,7 +560,9 @@ func parseHFTResponse(data []byte) (HFTResponsePacket, error) {
 		return HFTResponsePacket{}, fmt.Errorf("hft response: need %d bytes, got %d", hftSizeResponse, len(data))
 	}
 	// String and tail field offsets match pyarrow_client HFTDataStream._parse_response (data[6:22], etc.).
-	// Packet type for routing is wire byte 2 (see ReadHFT); bytes 4–5 are unused on the wire we model here.
+	// Response frames carry a 4-byte LE size at bytes 0–3 with type/segment at
+	// bytes 4–5 (hftPacketMeta); LTP/full ticks use a 2-byte size with type at
+	// byte 2. The old comment claiming byte 2 here was wrong — code rules.
 	r := HFTResponsePacket{
 		FrameSize:    int16(binary.LittleEndian.Uint16(data[0:2])),
 		PktType:      data[4],
