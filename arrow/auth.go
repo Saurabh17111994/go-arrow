@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/pquerna/otp"
@@ -18,8 +19,10 @@ import (
 
 // AuthResponse represents the structure of the authentication response from the API.
 type AuthResponse struct {
-	Status string `json:"status"` // API response status (e.g., "success" or "error").
-	Data   struct {
+	Status  string `json:"status"`  // API response status (e.g., "success" or "error").
+	Message string `json:"message"` // Server failure reason (P1-161).
+	Error   string `json:"error"`   // Alternate failure reason (P1-161).
+	Data    struct {
 		Name         string `json:"name"`         // User's name.
 		Token        string `json:"token"`        // Authentication token.
 		UserID       string `json:"userId"`       // Unique identifier for the user.
@@ -96,7 +99,9 @@ func (c *Client) Authenticate(requestToken string) (string, error) {
 	}
 
 	if authResponse.Status != "success" {
-		return "", fmt.Errorf("authentication failed: %s", authResponse.Status)
+		return "", fmt.Errorf("authentication failed: status=%s message=%s error=%s token_empty=%t",
+			authResponse.Status, truncStr(authResponse.Message, 200),
+			truncStr(authResponse.Error, 200), authResponse.Data.Token == "")
 	}
 	if authResponse.Data.Token == "" {
 		return "", fmt.Errorf("authentication failed: empty token in success response")
@@ -132,7 +137,10 @@ func (c *Client) Login() error {
 	c.mu.RLock()
 	loginAppID := c.Config.AppID
 	c.mu.RUnlock()
-	loginURL := fmt.Sprintf("https://app.arrow.trade/app/login?appId=%s", loginAppID)
+	// P1-163: the interactive login page stays on the fixed app host — it is
+	// a human browser URL, not API traffic, so BaseURL must not rewrite it.
+	// P1-293: AppID is a query value — escape reserved characters.
+	loginURL := fmt.Sprintf("https://app.arrow.trade/app/login?appId=%s", url.QueryEscape(loginAppID))
 	fmt.Println("Please visit the following URL to log in and retrieve your request token:")
 	fmt.Println(loginURL)
 	fmt.Println("After logging in, enter the request token below:")
@@ -181,12 +189,21 @@ func (c *Client) LoginContext(ctx context.Context, requestToken string) error {
 // Returns:
 //   - An error if authentication fails; otherwise, nil.
 func (c *Client) AutoLogin(username, password, totpSecret string) error {
-	loginURL := "https://api.arrow.trade/auth/app/login"
-
-	// WAVE9-A: snapshot AppID under RLock.
+	// WAVE9-A: snapshot config under RLock.
 	c.mu.RLock()
 	autoAppID := c.Config.AppID
+	authBase := strings.TrimSuffix(strings.TrimSpace(c.Config.BaseURL), "/")
 	c.mu.RUnlock()
+	// P1-163/165: auth endpoints derive from BaseURL so staging/mock can
+	// redirect the full login flow; production default keeps api.arrow.trade
+	// (BROKER-MD-001 live evidence 2026-08-13) since Config.BaseURL defaults
+	// to the edge host only for API traffic — auth callers set BaseURL to
+	// the auth host when a non-production flow is needed.
+	if authBase == "" {
+		authBase = "https://api.arrow.trade"
+	}
+	loginURL := authBase + "/auth/app/login"
+	validateURL := authBase + "/auth/validate-2fa"
 
 	// Step 1: Send Login Request
 	payload := fmt.Sprintf(`{
@@ -205,7 +222,10 @@ func (c *Client) AutoLogin(username, password, totpSecret string) error {
 	}
 
 	var loginResp struct {
-		Data struct {
+		Status  string `json:"status"`
+		Message string `json:"message"` // P1-164: server rejection reason.
+		Error   string `json:"error"`   // P1-164: alternate reason field.
+		Data    struct {
 			RequestID string `json:"requestId"` // Temporary request ID for 2FA validation.
 		} `json:"data"`
 	}
@@ -216,7 +236,9 @@ func (c *Client) AutoLogin(username, password, totpSecret string) error {
 	}
 
 	if loginResp.Data.RequestID == "" {
-		return &AuthError{Stage: "login", Err: fmt.Errorf("empty requestId from login response")}
+		return &AuthError{Stage: "login", Err: fmt.Errorf(
+			"empty requestId from login response (status=%s message=%s error=%s)",
+			loginResp.Status, truncStr(loginResp.Message, 200), truncStr(loginResp.Error, 200))}
 	}
 
 	// Step 2: Generate TOTP Code
@@ -233,14 +255,17 @@ func (c *Client) AutoLogin(username, password, totpSecret string) error {
 		"userID": "%s"
 	}`, passcode, loginResp.Data.RequestID, username)
 
-	resp, err = c.rawRequest("https://edge.arrow.trade/auth/validate-2fa", "POST", []byte(totpPayload))
+	resp, err = c.rawRequest(validateURL, "POST", []byte(totpPayload))
 	if err != nil {
 		log.Error().Err(err).Msg("2FA validation failed")
 		return &AuthError{Stage: "totp", Err: err}
 	}
 
 	var totpResp struct {
-		Data struct {
+		Status  string `json:"status"`
+		Message string `json:"message"` // P1-166: bad-TOTP rejection reason.
+		Error   string `json:"error"`   // P1-166: alternate reason field.
+		Data    struct {
 			RedirectURL string `json:"redirectUrl"` // URL containing the request token.
 		} `json:"data"`
 	}
@@ -251,6 +276,15 @@ func (c *Client) AutoLogin(username, password, totpSecret string) error {
 	}
 
 	// Step 4: Extract Request Token from Redirect URL
+	// P1-167: an empty redirect (2FA rejection/contract change) is a
+	// distinct failure from a present URL missing the token; only query
+	// form (?request-token=) is supported — fragment form (#...) is not
+	// observed on this endpoint and fails as missing-token.
+	if totpResp.Data.RedirectURL == "" {
+		return &AuthError{Stage: "redirect", Err: fmt.Errorf(
+			"empty redirectUrl in 2fa response (status=%s message=%s error=%s)",
+			totpResp.Status, truncStr(totpResp.Message, 200), truncStr(totpResp.Error, 200))}
+	}
 	parsedURL, err := url.Parse(totpResp.Data.RedirectURL)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to parse redirect URL")
@@ -267,7 +301,7 @@ func (c *Client) AutoLogin(username, password, totpSecret string) error {
 		log.Error().Err(err).Msg("Authentication failed")
 		return &AuthError{Stage: "authenticate", Err: err}
 	}
-	fmt.Println("AutoLogin successful.")
+	c.debugf("AutoLogin successful", nil)
 	return nil
 }
 
@@ -282,6 +316,14 @@ type AuthError struct {
 
 func (e *AuthError) Error() string { return "autologin " + e.Stage + ": " + e.Err.Error() }
 func (e *AuthError) Unwrap() error { return e.Err }
+
+// truncStr caps server-provided reason strings in errors (P1-161/164/166).
+func truncStr(s string, max int) string {
+	if len(s) > max {
+		return s[:max] + "..."
+	}
+	return s
+}
 
 // generateTOTP generates a TOTP (Time-based One-Time Password) code using a given secret.
 //
