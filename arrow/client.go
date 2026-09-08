@@ -62,7 +62,12 @@ func NewClient(appID, appSecret string) *Client {
 //   - A byte slice containing the response body if successful.
 //   - An error if the request fails.
 func (c *Client) request(endpoint string, method string, payload []byte) ([]byte, error) {
-	url := c.Config.BaseURL + endpoint
+	// Wave 9 Bundle A: copy auth fields under RLock so a concurrent
+	// SetToken (Lock) cannot interleave the read (P1-031/P1-035).
+	c.mu.RLock()
+	baseURL, appID, token := c.Config.BaseURL, c.Config.AppID, c.Config.Token
+	c.mu.RUnlock()
+	url := baseURL + endpoint
 	c.debugf("Making request", func(e *zerolog.Event) {
 		e.Str("url", url).Str("method", method)
 	})
@@ -70,8 +75,8 @@ func (c *Client) request(endpoint string, method string, payload []byte) ([]byte
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
 	req.SetRequestURI(url)
-	req.Header.Set("appId", c.Config.AppID)
-	req.Header.Set("token", c.Config.Token)
+	req.Header.Set("appId", appID)
+	req.Header.Set("token", token)
 	req.Header.SetMethod(method)
 	if len(payload) > 0 {
 		req.Header.SetContentType("application/json")
@@ -145,8 +150,12 @@ func (c *Client) rawRequestAuth(fullURL string, method string, payload []byte) (
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
 	req.SetRequestURI(fullURL)
-	req.Header.Set("appId", c.Config.AppID)
-	req.Header.Set("token", c.Config.Token)
+	// Wave 9 Bundle A: snapshot auth under RLock (SetToken races this path).
+	c.mu.RLock()
+	appID, token := c.Config.AppID, c.Config.Token
+	c.mu.RUnlock()
+	req.Header.Set("appId", appID)
+	req.Header.Set("token", token)
 	req.Header.SetMethod(method)
 	if len(payload) > 0 {
 		req.Header.SetContentType("application/json")
@@ -175,6 +184,8 @@ func (c *Client) rawRequestAuth(fullURL string, method string, payload []byte) (
 // Parameters:
 //   - token: The new authentication token.
 func (c *Client) SetToken(token string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.Config.Token = token
 }
 
@@ -210,6 +221,8 @@ func (c *Client) debugf(msg string, addFields func(*zerolog.Event)) {
 // Returns:
 //   - The current authentication token.
 func (c *Client) GetToken() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.Config.Token
 }
 
@@ -220,5 +233,7 @@ func (c *Client) GetToken() string {
 // Returns:
 //   - refreshToken: The refresh token.
 func (c *Client) GetRefreshToken() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.Config.RefreshToken
 }

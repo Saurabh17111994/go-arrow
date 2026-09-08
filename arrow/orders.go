@@ -4,6 +4,7 @@ package arrow
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -19,10 +20,80 @@ type OrderRequest struct {
 	TransactionType  string `json:"transactionType"`        // Order transaction type (BUY/SELL).
 	OrderType        string `json:"order"`                  // Type of order (e.g., MARKET, LIMIT).
 	Price            string `json:"price"`                  // Order price (applicable for LIMIT orders).
-	Validity         string `json:"validity"`               // Order validity (e.g., DAY, IOC).
+	Validity         string `json:"validity"`               // Order validity: DAY or IOC only (GTC/INDEX not executable).
 	Remarks          string `json:"remarks,omitempty"`      // Custom Remarks for order tracking (optional).
 	MarketProtection bool   `json:"mpp"`                    // Market protection flag; defaults to false when not set.
 	TriggerPrice     string `json:"triggerPrice,omitempty"` // Trigger price for SL orders.
+}
+
+// ValidateOrderRequest rejects orders the broker cannot execute before any
+// bytes hit the wire (Wave 9 Bundle F): Validity DAY|IOC only (P1-036 —
+// ValidityGTC is advertised but not broker-executable), Exchange excludes
+// INDEX (P1-172 — not an order venue), Price must be a positive number for
+// LMT (P1-191), Quantity must be a positive integer (P1-191 analogue).
+// Callers get a descriptive error; call Validate explicitly or rely on
+// PlaceOrder/ModifyOrder, which validate first.
+func ValidateOrderRequest(order OrderRequest) error {
+	switch strings.ToUpper(strings.TrimSpace(order.Validity)) {
+	case "DAY", "IOC":
+	default:
+		return fmt.Errorf("validity %q must be DAY or IOC", order.Validity)
+	}
+	if strings.EqualFold(strings.TrimSpace(order.Exchange), "INDEX") {
+		return fmt.Errorf("exchange INDEX is not an order venue")
+	}
+	if !isPositiveDecimal(order.Price) {
+		return fmt.Errorf("price %q must be a positive number", order.Price)
+	}
+	if !isPositiveInt(order.Quantity) {
+		return fmt.Errorf("quantity %q must be a positive integer", order.Quantity)
+	}
+	return nil
+}
+
+// isPositiveDecimal accepts canonical digits with one optional dot —
+// exponent, sign, separators, empty, zero all rejected, no floats involved.
+func isPositiveDecimal(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	dots, digits, positive := 0, 0, false
+	for _, r := range s {
+		switch {
+		case r == '.':
+			dots++
+			if dots > 1 {
+				return false
+			}
+		case r >= '0' && r <= '9':
+			digits++
+			if r != '0' {
+				positive = true
+			}
+		default:
+			return false
+		}
+	}
+	return digits > 0 && positive
+}
+
+// isPositiveInt accepts ASCII digits with at least one non-zero digit.
+func isPositiveInt(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	positive := false
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+		if r != '0' {
+			positive = true
+		}
+	}
+	return positive
 }
 
 // OrderResponse represents the API response after placing an order.
@@ -154,30 +225,42 @@ type Trade struct {
 func (c *Client) PlaceOrder(orderType string, order OrderRequest) (*OrderResponse, error) {
 	endpoint := fmt.Sprintf("/order/%s", orderType)
 
+	// Wave 9 Bundle F: validate before touching the wire.
+	if err := ValidateOrderRequest(order); err != nil {
+		return nil, err
+	}
+
 	payload, err := json.Marshal(order)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to serialize order request")
+		return nil, fmt.Errorf("place order marshal: %w", err)
+	}
 	c.debugf("Placing order", func(e *zerolog.Event) {
 		e.Str("orderType", orderType)
 	})
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to serialize order request")
-		return nil, err
-	}
 
 	resp, err := c.request(endpoint, "POST", payload)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to place order")
-		return nil, err
+		// Wave 9 Bundle F (P1-185-188 analogue): endpoint context.
+		return nil, fmt.Errorf("place order POST %s: %w", endpoint, err)
 	}
 
 	var result OrderResponse
 	if err := json.Unmarshal(resp, &result); err != nil {
 		log.Error().Err(err).Msg("Failed to parse order response")
-		return nil, err
+		return nil, fmt.Errorf("place order %s: bad response: %w", endpoint, err)
 	}
 
 	if result.Status != "success" {
 		log.Error().Str("errorCode", result.ErrorCode).Str("message", result.Message).Msg("Order placement failed")
-		return nil, fmt.Errorf("order placement failed")
+		return nil, fmt.Errorf("order placement failed: %s (%s)", result.Message, result.ErrorCode)
+	}
+
+	// Wave 9 Bundle F (P1-043): success with empty OrderNo is UNKNOWN, not
+	// accepted — the broker gave no trackable order.
+	if strings.TrimSpace(result.Data.OrderNo) == "" {
+		return nil, fmt.Errorf("order placement response missing orderNo")
 	}
 
 	c.debugf("Order placed successfully", func(e *zerolog.Event) {

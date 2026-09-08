@@ -7,8 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/klauspost/compress/zstd"
@@ -42,17 +45,25 @@ type HFTDataStream struct {
 	mu   sync.Mutex
 	zstd bool
 	zdec *zstd.Decoder
+	// Wave 9 Bundle C (P1-037): structural single-reader — a second
+	// concurrent ReadHFT/ReadHFTWithFrame on one socket is refused.
+	reading atomic.Bool
 }
 
 func (c *Client) ConnectHFTDataStream() (*HFTDataStream, error) {
+	// Wave 9 Bundle A: snapshot auth under RLock (same race as request).
+	c.mu.RLock()
+	appID, token := c.Config.AppID, c.Config.Token
+	c.mu.RUnlock()
 	q := url.Values{}
-	q.Set("appID", c.Config.AppID)
-	q.Set("token", c.Config.Token)
+	q.Set("appID", appID)
+	q.Set("token", token)
 	q.Set("zstd", "1")
 	u := fmt.Sprintf("%s?%s", hftStreamURL, q.Encode())
 	conn, _, err := websocket.DefaultDialer.Dial(u, nil)
 	if err != nil {
-		return nil, err
+		// Wave 9 Bundle D: host-only dial error (no credentials in query).
+		return nil, fmt.Errorf("dial %s: %w", hftStreamURL, err)
 	}
 	dec, err := zstd.NewReader(nil)
 	if err != nil {
@@ -74,6 +85,8 @@ func (s *HFTDataStream) Close() error {
 }
 
 func (s *HFTDataStream) decodeHFTPayload(payload []byte) ([]byte, error) {
+	// Wave 9 Bundle C (P1-038): nil check BEFORE any method/lock — a nil
+	// receiver previously panicked on the mutex.
 	if s == nil || !s.zstd || s.zdec == nil {
 		return payload, nil
 	}
@@ -182,10 +195,19 @@ func (s *HFTDataStream) SubscribeHFTSymbols(mode string, symbols []string, laten
 }
 
 // SubscribeHFTTokens subscribes integer instrument IDs on a single exchange segment (default NSE cash = 0).
+// latencyMs is tick spacing (50–60000); exchSeg is 0..3 (HFTExchNSECM..HFTExchBSEFO).
 func (s *HFTDataStream) SubscribeHFTTokens(mode string, exchSeg int, ids []int32, latencyMs int) error {
 	m, err := normalizeHFTMode(mode)
 	if err != nil {
 		return err
+	}
+	// Wave 9 Bundle C (P1-177): SDK-side range checks — callers must not
+	// rely on the broker to reject out-of-range segments/latency.
+	if exchSeg < HFTExchNSECM || exchSeg > HFTExchBSEFO {
+		return fmt.Errorf("hft subscribe: exchSeg %d out of range 0..3", exchSeg)
+	}
+	if latencyMs < 50 || latencyMs > 60000 {
+		return fmt.Errorf("hft subscribe: latency %d out of range 50..60000ms", latencyMs)
 	}
 	if len(ids) == 0 {
 		return errors.New("hft subscribe: empty ids")
@@ -210,10 +232,24 @@ func (s *HFTDataStream) SubscribeHFTBySegment(mode string, segments map[int][]in
 	if err != nil {
 		return err
 	}
+	if latencyMs < 50 || latencyMs > 60000 {
+		return fmt.Errorf("hft subscribe: latency %d out of range 50..60000ms", latencyMs)
+	}
+	// Wave 9 Bundle C: sort segment keys so identical calls produce
+	// identical wire order (Go map iteration is nondeterministic).
+	segs := make([]int, 0, len(segments))
+	for seg := range segments {
+		segs = append(segs, seg)
+	}
+	sort.Ints(segs)
 	var symIDs []map[string]any
-	for seg, ids := range segments {
+	for _, seg := range segs {
+		ids := segments[seg]
 		if len(ids) == 0 {
 			continue
+		}
+		if seg < HFTExchNSECM || seg > HFTExchBSEFO {
+			return fmt.Errorf("hft subscribe: exchSeg %d out of range 0..3", seg)
 		}
 		cp := make([]int32, len(ids))
 		copy(cp, ids)
@@ -262,16 +298,43 @@ func (s *HFTDataStream) UnsubscribeHFTTokens(mode string, exchSeg int, ids []int
 func (s *HFTDataStream) writeJSON(v any) error {
 	b, err := json.Marshal(v)
 	if err != nil {
-		return err
+		// Wave 9 Bundle C (P1-178): op context on marshal failure.
+		return fmt.Errorf("hft writeJSON marshal: %w", err)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.conn.WriteMessage(websocket.TextMessage, b)
+	if s == nil || s.conn == nil {
+		// Wave 9 Bundle C (P1-199 analogue): nil conn/stream is a caller
+		// bug — error, never panic.
+		return fmt.Errorf("hft writeJSON: nil connection")
+	}
+	if err := s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		// Wave 9 Bundle C (P1-178): op context on deadline failure.
+		return fmt.Errorf("hft writeJSON set deadline: %w", err)
+	}
+	// Wave 9 Bundle C: a wedged TCP connection must not block writes forever.
+	if err := s.conn.WriteMessage(websocket.TextMessage, b); err != nil {
+		return fmt.Errorf("hft writeJSON write: %w", err)
+	}
+	return nil
 }
 
 // ReadHFT dispatches binary HFT packets until ctx is done or the socket errors.
 // Text frames (e.g. keepalives) are ignored. Callbacks may be nil.
 func (s *HFTDataStream) ReadHFT(ctx context.Context, onLTP func(HFTLTPTick), onFull func(HFTFullTick), onResponse func(HFTResponsePacket), onError func(error)) {
+	// Wave 9 Bundle C (P1-037): structural single-reader — a second
+	// concurrent reader on one socket is refused instead of interleaving
+	// binary frames.
+	if s == nil {
+		return
+	}
+	if !s.reading.CompareAndSwap(false, true) {
+		if onError != nil {
+			onError(fmt.Errorf("hft ReadHFT: concurrent reader refused"))
+		}
+		return
+	}
+	defer s.reading.Store(false)
 	for {
 		select {
 		case <-ctx.Done():

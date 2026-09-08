@@ -68,13 +68,19 @@ type DataStream struct {
 }
 
 func (c *Client) ConnectDataStream() (*DataStream, error) {
+	// Wave 9 Bundle D (P1-045): snapshot token under RLock (cf. Bundle A).
+	c.mu.RLock()
+	appID, token := c.Config.AppID, c.Config.Token
+	c.mu.RUnlock()
 	q := url.Values{}
-	q.Set("appID", c.Config.AppID)
-	q.Set("token", c.Config.Token)
+	q.Set("appID", appID)
+	q.Set("token", token)
 	u := fmt.Sprintf("%s?%s", dataStreamURL, q.Encode())
+	// Wave 9 Bundle D (P1-045/046): handshake errors carry the WS host
+	// only — never the query (appID/token are credentials).
 	conn, _, err := websocket.DefaultDialer.Dial(u, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dial %s: %w", dataStreamURL, err)
 	}
 	return &DataStream{conn: conn}, nil
 }
@@ -99,8 +105,25 @@ func (s *DataStream) sendSubMessage(code string, mode StreamMode, tokens []int32
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.conn.WriteJSON(msg)
+	if s.conn == nil {
+		// Wave 9 Bundle D (P1-199): nil conn is a caller bug, not a panic.
+		return fmt.Errorf("sub %s %s: nil connection", code, mode)
+	}
+	if err := s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return fmt.Errorf("sub %s %s set deadline: %w", code, mode, err)
+	}
+	// Wave 9 D (P1-103 analogue for HFT writeJSON): wedged TCP must not
+	// block the writer forever; op context on failure.
+	if err := s.conn.WriteJSON(msg); err != nil {
+		return fmt.Errorf("sub %s %s write: %w", code, mode, err)
+	}
+	return nil
 }
+
+// Wave 9 Bundle D (P1-200): per-iteration read deadline (default 30s,
+// override with SetReadDeadlineMs on the stream). A stalled TCP connection
+// surfaces as an error and the loop returns instead of blocking forever.
+const defaultStreamReadDeadlineMs = 30_000
 
 func (s *DataStream) ReadTicks(ctx context.Context, onTick func(MarketTick), onError func(error)) {
 	for {
@@ -109,6 +132,7 @@ func (s *DataStream) ReadTicks(ctx context.Context, onTick func(MarketTick), onE
 			return
 		default:
 		}
+		_ = s.conn.SetReadDeadline(time.Now().Add(defaultStreamReadDeadlineMs * time.Millisecond))
 		_, payload, err := s.conn.ReadMessage()
 		if err != nil {
 			if onError != nil && !errors.Is(err, websocket.ErrCloseSent) {
@@ -221,13 +245,16 @@ type OrderStream struct {
 }
 
 func (c *Client) ConnectOrderStream() (*OrderStream, error) {
+	c.mu.RLock()
+	appID, token := c.Config.AppID, c.Config.Token
+	c.mu.RUnlock()
 	q := url.Values{}
-	q.Set("appID", c.Config.AppID)
-	q.Set("token", c.Config.Token)
+	q.Set("appID", appID)
+	q.Set("token", token)
 	u := fmt.Sprintf("%s?%s", orderStreamURL, q.Encode())
 	conn, _, err := websocket.DefaultDialer.Dial(u, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dial %s: %w", orderStreamURL, err)
 	}
 	return &OrderStream{conn: conn}, nil
 }

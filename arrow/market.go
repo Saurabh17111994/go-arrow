@@ -14,6 +14,17 @@ type GenericResponse[T any] struct {
 	Status string `json:"status"`
 }
 
+// RequireSuccess rejects unknown status values instead of zero-value
+// accepting them (Wave 9 Bundle F, P1-041/042): only "success" passes;
+// anything else (including "" and future broker values) is an error naming
+// the received status so callers notice new enum members.
+func (r GenericResponse[T]) RequireSuccess(op string) error {
+	if r.Status == "success" {
+		return nil
+	}
+	return fmt.Errorf("%s: unexpected status %q", op, r.Status)
+}
+
 type BasketMarginRequest struct {
 	Orders           []MarginRequest `json:"orders"`
 	IncludePositions bool            `json:"includePositions"`
