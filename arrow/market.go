@@ -192,10 +192,13 @@ const (
 )
 
 func (c *Client) GetInstrumentsCSV(segment InstrumentSegment) (string, error) {
-	path := "/" + strings.ToLower(string(segment))
-	if segment == "" {
-		path = "/all"
+	// R-189: path-escape the segment — interpolating raw input into the URL
+	// path could inject unexpected segments.
+	seg := strings.ToLower(string(segment))
+	if seg == "" {
+		seg = "all"
 	}
+	path := "/" + url.PathEscape(seg)
 	resp, err := c.request(path, "GET", nil)
 	if err != nil {
 		return "", err
@@ -257,7 +260,10 @@ func (c *Client) GetCandleData(exchange Exchange, token, interval, fromTimestamp
 	if oi {
 		q.Set("oi", "1")
 	}
-	endpoint := fmt.Sprintf("%s/candle/%s/%s/%s?%s", base, strings.ToLower(string(exchange)), token, interval, q.Encode())
+	// R-189: path-escape exchange/token/interval.
+	endpoint := fmt.Sprintf("%s/candle/%s/%s/%s?%s", base,
+		url.PathEscape(strings.ToLower(string(exchange))),
+		url.PathEscape(token), url.PathEscape(interval), q.Encode())
 	resp, err := c.rawRequestAuth(endpoint, "GET", nil)
 	if err != nil {
 		return nil, err
@@ -274,7 +280,7 @@ func (c *Client) GetCandleData(exchange Exchange, token, interval, fromTimestamp
 	return json.RawMessage(trimmed), nil
 }
 
-// apiError builds a descriptive error for a non-success API response:
+// apiError builds a descriptive error for a non-success API response (R-282):
 // it parses the server's errorMessage/errorCode fields so operators see the
 // real rejection reason instead of a bare status string.
 func apiError(op, status string, resp []byte) error {
