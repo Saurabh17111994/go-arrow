@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -78,14 +79,22 @@ func (c *Client) Authenticate(requestToken string) (string, error) {
 	}
 	checksum := GenerateChecksum(authAppID, authSecret, requestToken)
 
-	payload := fmt.Sprintf(`{
-		"checkSum": "%s",
-		"checksum": "%s",
-		"token": "%s",
-		"appId": "%s"
-	}`, checksum, checksum, requestToken, authAppID)
+	// R-099: json.Marshal — raw Sprintf interpolation produced invalid JSON
+	// when credentials contained quotes, backslashes, or control characters.
+	payloadBody := struct {
+		CheckSum string `json:"checkSum"`
+		Checksum string `json:"checksum"`
+		Token    string `json:"token"`
+		AppID    string `json:"appID"`
+	}{
+		CheckSum: checksum, Checksum: checksum, Token: requestToken, AppID: authAppID,
+	}
+	payload, err := json.Marshal(payloadBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal authenticate payload: %w", err)
+	}
 
-	responseBody, err := c.request("/auth/app/authenticate-token", "POST", []byte(payload))
+	responseBody, err := c.request("/auth/app/authenticate-token", "POST", payload)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to authenticate")
 		// WAVE9-B (P1-166): endpoint context on transport errors.
@@ -98,13 +107,13 @@ func (c *Client) Authenticate(requestToken string) (string, error) {
 		return "", fmt.Errorf("authenticate /auth/app/authenticate-token decode: %w", err)
 	}
 
-	if authResponse.Status != "success" {
+	// R-100: a "success" status without a token is NOT a successful
+	// authentication — treat it as an error so callers never proceed with an
+	// empty credential. Server reason included (P1-161).
+	if authResponse.Status != "success" || authResponse.Data.Token == "" {
 		return "", fmt.Errorf("authentication failed: status=%s message=%s error=%s token_empty=%t",
 			authResponse.Status, truncStr(authResponse.Message, 200),
 			truncStr(authResponse.Error, 200), authResponse.Data.Token == "")
-	}
-	if authResponse.Data.Token == "" {
-		return "", fmt.Errorf("authentication failed: empty token in success response")
 	}
 
 	// Update client token after authentication (WAVE9-A Lock: orders vs readers).
@@ -125,6 +134,9 @@ func (c *Client) Authenticate(requestToken string) (string, error) {
 //
 // This function prints a login URL and asks the user to enter the request token
 // to complete the authentication process.
+//
+// R-239: returns an error so automated flows can branch on failure instead of
+// assuming the interactive login succeeded.
 //
 // WARNING (WAVE9-B, P1-162): this function OWNS stdin — it blocks on
 // fmt.Scanln with no timeout. Never call it from a service/bridge process;
@@ -205,17 +217,23 @@ func (c *Client) AutoLogin(username, password, totpSecret string) error {
 	loginURL := authBase + "/auth/app/login"
 	validateURL := authBase + "/auth/validate-2fa"
 
-	// Step 1: Send Login Request
-	payload := fmt.Sprintf(`{
-		"userID": "%s",
-		"password": "%s",
-		"captchaValue": "",
-		"captchaID": null,
-		"appID": "%s",
-		"isAppLogin": true
-	}`, username, password, autoAppID)
-
-	resp, err := c.rawRequest(loginURL, "POST", []byte(payload))
+	// Step 1: Send Login Request (R-099: json.Marshal, never raw interpolation)
+	loginBody := struct {
+		UserID       string `json:"userID"`
+		Password     string `json:"password"`
+		CaptchaValue string `json:"captchaValue"`
+		CaptchaID    any    `json:"captchaID"`
+		AppID        string `json:"appID"`
+		IsAppLogin   bool   `json:"isAppLogin"`
+	}{
+		UserID: username, Password: password, CaptchaID: nil,
+		AppID: autoAppID, IsAppLogin: true,
+	}
+	loginPayload, err := json.Marshal(loginBody)
+	if err != nil {
+		return fmt.Errorf("marshal login payload: %w", err)
+	}
+	resp, err := c.rawRequest(loginURL, "POST", loginPayload)
 	if err != nil {
 		log.Error().Err(err).Msg("Login request failed")
 		return &AuthError{Stage: "login", Err: err}
@@ -235,6 +253,7 @@ func (c *Client) AutoLogin(username, password, totpSecret string) error {
 		return &AuthError{Stage: "login", Err: err}
 	}
 
+	// R-100: a missing requestId would send a broken 2FA request — fail fast.
 	if loginResp.Data.RequestID == "" {
 		return &AuthError{Stage: "login", Err: fmt.Errorf(
 			"empty requestId from login response (status=%s message=%s error=%s)",
@@ -248,14 +267,19 @@ func (c *Client) AutoLogin(username, password, totpSecret string) error {
 		return &AuthError{Stage: "totp", Err: err}
 	}
 
-	// Step 3: Validate 2FA
-	totpPayload := fmt.Sprintf(`{
-		"code": "%s",
-		"requestId": "%s",
-		"userID": "%s"
-	}`, passcode, loginResp.Data.RequestID, username)
-
-	resp, err = c.rawRequest(validateURL, "POST", []byte(totpPayload))
+	// Step 3: Validate 2FA (R-099: json.Marshal)
+	totpBody := struct {
+		Code      string `json:"code"`
+		RequestID string `json:"requestId"`
+		UserID    string `json:"userID"`
+	}{
+		Code: passcode, RequestID: loginResp.Data.RequestID, UserID: username,
+	}
+	totpPayload, err := json.Marshal(totpBody)
+	if err != nil {
+		return fmt.Errorf("marshal 2fa payload: %w", err)
+	}
+	resp, err = c.rawRequest(validateURL, "POST", totpPayload)
 	if err != nil {
 		log.Error().Err(err).Msg("2FA validation failed")
 		return &AuthError{Stage: "totp", Err: err}
@@ -292,6 +316,8 @@ func (c *Client) AutoLogin(username, password, totpSecret string) error {
 	}
 
 	requestToken := parsedURL.Query().Get("request-token")
+	// R-100: never authenticate with an empty token — the old code silently
+	// proceeded and the Authenticate call failed opaquely.
 	if requestToken == "" {
 		return &AuthError{Stage: "redirect", Err: fmt.Errorf("no request-token in redirect URL")}
 	}
@@ -301,7 +327,11 @@ func (c *Client) AutoLogin(username, password, totpSecret string) error {
 		log.Error().Err(err).Msg("Authentication failed")
 		return &AuthError{Stage: "authenticate", Err: err}
 	}
-	c.debugf("AutoLogin successful", nil)
+	// P1-294 NOT APPLIED as asked: downstream pins this stderr line
+	// (ingestion/bridge run logs + 2040158 kept it deliberately). debugf
+	// already logs the same event for quiet callers; removing the line
+	// would silently break the pinned run-log contract.
+	fmt.Fprintln(os.Stderr, "arrow-auth: AutoLogin successful.")
 	return nil
 }
 
