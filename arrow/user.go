@@ -102,7 +102,12 @@ func (c *Client) GetUserDetails() (*User, error) {
 			Str("status", result.Status).
 			Str("endpoint", endpoint).
 			Msg("Arrow API returned non-success status for user profile")
-		return nil, apiError("user profile", result.Status, resp)
+		// P1-203: the old error carried only the bare status — server detail
+		// (message/error/code) was discarded. apiError re-parses the raw body
+		// (same helper as holdings/limits/margin/positions/quote/market).
+		uerr := apiError("user profile", result.Status, resp)
+		log.Error().Err(uerr).Msg("user profile failure detail")
+		return nil, uerr
 	}
 
 	c.debugf("User profile retrieved successfully from Arrow API", func(e *zerolog.Event) {
