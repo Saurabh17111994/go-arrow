@@ -7,8 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/klauspost/compress/zstd"
@@ -41,16 +44,30 @@ type HFTDataStream struct {
 	conn *websocket.Conn
 	mu   sync.Mutex
 	zstd bool
-	zdec *zstd.Decoder
+	// WAVE9-C (P1-037): zdec is shared between the read goroutine
+	// (DecodeAll) and Close (zdec.Close) — guard it so closing the stream
+	// cannot race an in-flight decode. Decode takes the write lock:
+	// klauspost/compress zstd.Decoder is NOT safe for concurrent use.
+	zdecMu sync.RWMutex
+	zdec   *zstd.Decoder
+	// WAVE9-C (P1-037): structural single-reader — a second concurrent
+	// ReadHFT on one socket is refused instead of interleaving binary frames.
+	reading atomic.Bool
 }
 
 func (c *Client) ConnectHFTDataStream() (*HFTDataStream, error) {
+	// WAVE9-A: snapshot auth under RLock (SetToken races dial).
+	c.mu.RLock()
+	hftAppID, hftToken := c.Config.AppID, c.Config.Token
+	c.mu.RUnlock()
 	q := url.Values{}
-	q.Set("appID", c.Config.AppID)
-	q.Set("token", c.Config.Token)
+	q.Set("appID", hftAppID)
+	q.Set("token", hftToken)
 	q.Set("zstd", "1")
 	u := fmt.Sprintf("%s?%s", hftStreamURL, q.Encode())
-	conn, _, err := websocket.DefaultDialer.Dial(u, nil)
+	// WAVE9-D: dialStream reports host + HTTP status, never credentials
+	// (the query carries appID/token).
+	conn, err := dialStream(u)
 	if err != nil {
 		return nil, err
 	}
@@ -66,15 +83,26 @@ func (s *HFTDataStream) Close() error {
 	if s == nil || s.conn == nil {
 		return nil
 	}
+	// Take the write lock before closing the decoder so a concurrent
+	// decodeHFTPayload holding the read lock finishes first.
+	s.zdecMu.Lock()
 	if s.zdec != nil {
 		s.zdec.Close()
 		s.zdec = nil
 	}
+	s.zdecMu.Unlock()
 	return s.conn.Close()
 }
 
 func (s *HFTDataStream) decodeHFTPayload(payload []byte) ([]byte, error) {
+	// WAVE9-C (P1-038): nil check BEFORE any lock — a nil receiver
+	// would panic on zdecMu.RLock() before reaching the check.
 	if s == nil || !s.zstd || s.zdec == nil {
+		return payload, nil
+	}
+	s.zdecMu.RLock()
+	defer s.zdecMu.RUnlock()
+	if s.zdec == nil {
 		return payload, nil
 	}
 	return s.zdec.DecodeAll(payload, nil)
@@ -123,8 +151,15 @@ func (s *HFTDataStream) dispatchHFTPayload(payload []byte, onLTP func(HFTLTPTick
 		payload = payload[n:]
 		switch pkt {
 		case hftPktResponse:
+			resp, perr := parseHFTResponse(frame)
+			if perr != nil {
+				if onError != nil {
+					onError(perr)
+				}
+				continue
+			}
 			if onResponse != nil {
-				onResponse(parseHFTResponse(frame))
+				onResponse(resp)
 			}
 		case hftPktLTP:
 			if onLTP != nil {
@@ -169,6 +204,9 @@ func (s *HFTDataStream) SubscribeHFTSymbols(mode string, symbols []string, laten
 	if err != nil {
 		return err
 	}
+	if latencyMs < 50 || latencyMs > 60000 {
+		return fmt.Errorf("hft subscribe: latency %d out of range 50..60000ms", latencyMs)
+	}
 	if len(symbols) == 0 {
 		return errors.New("hft subscribe: empty symbols")
 	}
@@ -182,10 +220,19 @@ func (s *HFTDataStream) SubscribeHFTSymbols(mode string, symbols []string, laten
 }
 
 // SubscribeHFTTokens subscribes integer instrument IDs on a single exchange segment (default NSE cash = 0).
+// latencyMs is tick spacing (50–60000); exchSeg is 0..3 (HFTExchNSECM..HFTExchBSEFO).
 func (s *HFTDataStream) SubscribeHFTTokens(mode string, exchSeg int, ids []int32, latencyMs int) error {
 	m, err := normalizeHFTMode(mode)
 	if err != nil {
 		return err
+	}
+	// WAVE9-C (P1-177): SDK-side range checks — callers must not rely on
+	// the broker to reject out-of-range segments/latency.
+	if exchSeg < HFTExchNSECM || exchSeg > HFTExchBSEFO {
+		return fmt.Errorf("hft subscribe: exchSeg %d out of range 0..3", exchSeg)
+	}
+	if latencyMs < 50 || latencyMs > 60000 {
+		return fmt.Errorf("hft subscribe: latency %d out of range 50..60000ms", latencyMs)
 	}
 	if len(ids) == 0 {
 		return errors.New("hft subscribe: empty ids")
@@ -210,10 +257,24 @@ func (s *HFTDataStream) SubscribeHFTBySegment(mode string, segments map[int][]in
 	if err != nil {
 		return err
 	}
+	if latencyMs < 50 || latencyMs > 60000 {
+		return fmt.Errorf("hft subscribe: latency %d out of range 50..60000ms", latencyMs)
+	}
+	// Sort segment keys so identical calls produce identical wire
+	// order (Go map iteration is nondeterministic).
+	segs := make([]int, 0, len(segments))
+	for seg := range segments {
+		segs = append(segs, seg)
+	}
+	sort.Ints(segs)
 	var symIDs []map[string]any
-	for seg, ids := range segments {
+	for _, seg := range segs {
+		ids := segments[seg]
 		if len(ids) == 0 {
 			continue
+		}
+		if seg < HFTExchNSECM || seg > HFTExchBSEFO {
+			return fmt.Errorf("hft subscribe: exchSeg %d out of range 0..3", seg)
 		}
 		cp := make([]int32, len(ids))
 		copy(cp, ids)
@@ -247,6 +308,9 @@ func (s *HFTDataStream) UnsubscribeHFTTokens(mode string, exchSeg int, ids []int
 	if err != nil {
 		return err
 	}
+	if exchSeg < HFTExchNSECM || exchSeg > HFTExchBSEFO {
+		return fmt.Errorf("hft unsubscribe: exchSeg %d out of range 0..3", exchSeg)
+	}
 	arr := make([]int32, len(ids))
 	copy(arr, ids)
 	msg := map[string]any{
@@ -262,24 +326,66 @@ func (s *HFTDataStream) UnsubscribeHFTTokens(mode string, exchSeg int, ids []int
 func (s *HFTDataStream) writeJSON(v any) error {
 	b, err := json.Marshal(v)
 	if err != nil {
-		return err
+		// WAVE9-C (P1-178 writer half): op context on marshal failure.
+		return fmt.Errorf("hft writeJSON marshal: %w", err)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.conn.WriteMessage(websocket.TextMessage, b)
+	if s == nil || s.conn == nil {
+		return fmt.Errorf("hft writeJSON: nil connection")
+	}
+	// A wedged TCP connection must not block writes forever.
+	if err := s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return fmt.Errorf("hft writeJSON set deadline: %w", err)
+	}
+	if err := s.conn.WriteMessage(websocket.TextMessage, b); err != nil {
+		return fmt.Errorf("hft writeJSON write: %w", err)
+	}
+	return nil
 }
 
 // ReadHFT dispatches binary HFT packets until ctx is done or the socket errors.
 // Text frames (e.g. keepalives) are ignored. Callbacks may be nil.
 func (s *HFTDataStream) ReadHFT(ctx context.Context, onLTP func(HFTLTPTick), onFull func(HFTFullTick), onResponse func(HFTResponsePacket), onError func(error)) {
+	if s == nil || s.conn == nil {
+		if onError != nil {
+			onError(fmt.Errorf("hft read: nil stream/connection"))
+		}
+		return
+	}
+	// WAVE9-C (P1-037): a websocket has ONE read side — a second
+	// concurrent ReadHFT would interleave binary frames and corrupt both
+	// decodes. Refuse instead of interleaving.
+	if !s.reading.CompareAndSwap(false, true) {
+		if onError != nil {
+			onError(fmt.Errorf("hft read: concurrent ReadHFT on one stream refused"))
+		}
+		return
+	}
+	defer s.reading.Store(false)
+	// WAVE9-C (P1-178 reader half): ctx cancellation must unblock the
+	// read promptly — close the connection when ctx fires so ReadMessage
+	// returns instead of stalling up to the 30s read deadline.
+	stop := context.AfterFunc(ctx, func() {
+		if s != nil && s.conn != nil {
+			_ = s.conn.UnderlyingConn().Close()
+		}
+	})
+	defer stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
+		// A wedged TCP connection must not block reads forever; a 30s
+		// deadline surfaces dead connections via onError.
+		_ = s.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		mt, payload, err := s.conn.ReadMessage()
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			if onError != nil && !errors.Is(err, websocket.ErrCloseSent) {
 				onError(err)
 			}
@@ -431,7 +537,15 @@ type HFTResponsePacket struct {
 	ModeStr        string
 }
 
-func parseHFTResponse(data []byte) HFTResponsePacket {
+// parseHFTResponse decodes a 540-byte subscribe/unsubscribe ack frame.
+// WAVE9-C (P1-039): the old signature could not fail and panicked (slice
+// out of range) on any input <540 bytes. Short input is now an error —
+// the dispatch path guarantees full frames, so any future/test caller
+// gets a diagnosable error instead of a panic.
+func parseHFTResponse(data []byte) (HFTResponsePacket, error) {
+	if len(data) < hftSizeResponse {
+		return HFTResponsePacket{}, fmt.Errorf("hft response: need %d bytes, got %d", hftSizeResponse, len(data))
+	}
 	// String and tail field offsets match pyarrow_client HFTDataStream._parse_response (data[6:22], etc.).
 	// Packet type for routing is wire byte 2 (see ReadHFT); bytes 4–5 are unused on the wire we model here.
 	r := HFTResponsePacket{
@@ -461,5 +575,5 @@ func parseHFTResponse(data []byte) HFTResponsePacket {
 	default:
 		r.ModeStr = "unknown"
 	}
-	return r
+	return r, nil
 }

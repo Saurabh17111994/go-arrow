@@ -1,0 +1,7 @@
+# Example Arrow SDK config — copy to .env (never commit .env*).
+# WAVE9-G (P1-159): rotation path documented here.
+ARROW_APP_ID=
+ARROW_APP_SECRET=
+ARROW_USER_ID=
+ARROW_PASSWORD=
+ARROW_TOTP_SECRET=

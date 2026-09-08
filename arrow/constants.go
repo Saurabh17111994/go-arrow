@@ -3,6 +3,10 @@ package arrow
 
 // Exchange represents a trading exchange.
 // Use these constants when specifying exchange in requests (e.g., arrow.ExchangeNSE).
+//
+// WARNING (WAVE9-F, P1-172): ExchangeINDEX is quote/market-data-only —
+// ValidateOrderRequest rejects it on the order path. Keep it for
+// /info/quote and option-chain symbols; never place orders on INDEX.
 type Exchange string
 
 const (
@@ -47,6 +51,10 @@ const (
 )
 
 // Validity represents order validity period.
+//
+// NOTE (WAVE9-F, P1-036): only DAY and IOC are accepted on the order path
+// (ValidateOrderRequest rejects GTC). ValidityGTC is retained as a constant
+// for broker responses that echo it — do not send GTC on PlaceOrder.
 type Validity string
 
 const (

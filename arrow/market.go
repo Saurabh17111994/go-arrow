@@ -14,6 +14,21 @@ type GenericResponse[T any] struct {
 	Status string `json:"status"`
 }
 
+// RequireSuccess rejects unknown status values instead of zero-value
+// accepting them: only "success" passes; "error" maps to errWithStatus
+// and anything else is an explicit unknown-status error so a new broker
+// enum can never slip through as success. (WAVE9-F, P1-041/042.)
+func (r GenericResponse[T]) RequireSuccess(op string) error {
+	switch r.Status {
+	case "success":
+		return nil
+	case "error", "":
+		return fmt.Errorf("%s failed with status: %s", op, r.Status)
+	default:
+		return fmt.Errorf("%s failed: unknown status %q", op, r.Status)
+	}
+}
+
 type BasketMarginRequest struct {
 	Orders           []MarginRequest `json:"orders"`
 	IncludePositions bool            `json:"includePositions"`

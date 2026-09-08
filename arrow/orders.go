@@ -4,6 +4,7 @@ package arrow
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -140,6 +141,98 @@ type Trade struct {
 	FillTime        string `json:"fillTime"`
 }
 
+// ValidateOrderRequest enforces the broker-supported order contract
+// SDK-side so misconfigured callers fail fast instead of at broker
+// validation. (WAVE9-F: P1-036 GTC, P1-172 INDEX, P1-191 price/qty.)
+//
+//   - Validity: DAY|IOC only. ValidityGTC exists as a constant but the
+//     broker path takes DAY|IOC — GTC is rejected here.
+//   - Exchange: must be non-empty and not INDEX (INDEX is
+//     quote/market-data-only, not order-reachable).
+//   - Quantity: positive integer (> 0, digits only — no floats).
+//   - Price: positive decimal (> 0) whenever set. Empty price is allowed
+//     (MARKET orders carry no price); a present price must be > 0 with
+//     digits and at most one decimal point.
+//   - Symbol/Product/TransactionType/OrderType: non-empty.
+func ValidateOrderRequest(orderType string, order OrderRequest) error {
+	if strings.TrimSpace(orderType) == "" {
+		return fmt.Errorf("order: empty order variety (want e.g. regular)")
+	}
+	if strings.ContainsAny(orderType, "/?#") {
+		return fmt.Errorf("order: invalid order variety %q", orderType)
+	}
+	switch strings.ToUpper(strings.TrimSpace(order.Validity)) {
+	case "DAY", "IOC":
+	default:
+		return fmt.Errorf("order: unsupported validity %q (broker path takes DAY|IOC)", order.Validity)
+	}
+	if strings.TrimSpace(order.Exchange) == "" {
+		return fmt.Errorf("order: empty exchange")
+	}
+	if strings.EqualFold(strings.TrimSpace(order.Exchange), "INDEX") {
+		return fmt.Errorf("order: exchange INDEX is quote-only, not order-reachable")
+	}
+	if !isPositiveInt(order.Quantity) {
+		return fmt.Errorf("order: quantity must be a positive integer, got %q", order.Quantity)
+	}
+	if strings.TrimSpace(order.Price) != "" && !isPositiveDecimal(order.Price) {
+		return fmt.Errorf("order: price must be > 0 when set, got %q", order.Price)
+	}
+	if strings.TrimSpace(order.Symbol) == "" {
+		return fmt.Errorf("order: empty symbol")
+	}
+	if strings.TrimSpace(order.Product) == "" {
+		return fmt.Errorf("order: empty product")
+	}
+	if strings.TrimSpace(order.TransactionType) == "" {
+		return fmt.Errorf("order: empty transactionType")
+	}
+	if strings.TrimSpace(order.OrderType) == "" {
+		return fmt.Errorf("order: empty order type")
+	}
+	return nil
+}
+
+// isPositiveInt reports whether s is a positive integer (digits only, > 0,
+// no sign, no decimal point, no exponent).
+func isPositiveInt(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	s = strings.TrimLeft(s, "0")
+	return s != ""
+}
+
+// isPositiveDecimal reports whether s is a positive decimal number (> 0):
+// digits with at most one decimal point, no sign, no exponent.
+func isPositiveDecimal(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	seenDot := false
+	seenNonZero := false
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			if r != '0' {
+				seenNonZero = true
+			}
+		case r == '.' && !seenDot:
+			seenDot = true
+		default:
+			return false
+		}
+	}
+	return seenNonZero
+}
+
 // PlaceOrder places a new order in the market.
 //
 // It sends a POST request to the API endpoint "/order/{orderType}" with the order details.
@@ -152,6 +245,10 @@ type Trade struct {
 //   - A pointer to OrderResponse with the order confirmation details if successful.
 //   - An error if the order placement fails.
 func (c *Client) PlaceOrder(orderType string, order OrderRequest) (*OrderResponse, error) {
+	// WAVE9-F: fail fast SDK-side (GTC/INDEX/price/qty) before touching the wire.
+	if err := ValidateOrderRequest(orderType, order); err != nil {
+		return nil, err
+	}
 	endpoint := fmt.Sprintf("/order/%s", orderType)
 
 	payload, err := json.Marshal(order)
@@ -160,24 +257,35 @@ func (c *Client) PlaceOrder(orderType string, order OrderRequest) (*OrderRespons
 	})
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to serialize order request")
-		return nil, err
+		return nil, fmt.Errorf("place order %s serialize: %w", endpoint, err)
 	}
 
 	resp, err := c.request(endpoint, "POST", payload)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to place order")
-		return nil, err
+		return nil, fmt.Errorf("place order %s: %w", endpoint, err)
 	}
 
 	var result OrderResponse
 	if err := json.Unmarshal(resp, &result); err != nil {
 		log.Error().Err(err).Msg("Failed to parse order response")
-		return nil, err
+		return nil, fmt.Errorf("place order %s decode: %w", endpoint, err)
 	}
 
 	if result.Status != "success" {
 		log.Error().Str("errorCode", result.ErrorCode).Str("message", result.Message).Msg("Order placement failed")
-		return nil, fmt.Errorf("order placement failed")
+		if result.ErrorCode != "" {
+			return nil, fmt.Errorf("order placement failed (status=%s, code=%s, message=%s)",
+				result.Status, result.ErrorCode, result.Message)
+		}
+		return nil, fmt.Errorf("order placement failed (status=%s, message=%s)",
+			result.Status, result.Message)
+	}
+	if result.Data.OrderNo == "" {
+		// WAVE9-F (P1-043): success without OrderNo is untrackable — a
+		// later Modify/Cancel with "" would hit /order/regular/ (wrong
+		// endpoint). Reject instead of returning a placed-looking order.
+		return nil, fmt.Errorf("order placement failed: success response with empty orderNo")
 	}
 
 	c.debugf("Order placed successfully", func(e *zerolog.Event) {
@@ -199,28 +307,41 @@ func (c *Client) PlaceOrder(orderType string, order OrderRequest) (*OrderRespons
 //   - A pointer to OrderResponse with the updated order details if successful.
 //   - An error if the modification fails.
 func (c *Client) ModifyOrder(orderType, orderID string, order OrderRequest) (*OrderResponse, error) {
+	if err := ValidateOrderRequest(orderType, order); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(orderID) == "" {
+		return nil, fmt.Errorf("order modify: empty orderID")
+	}
 	endpoint := fmt.Sprintf("/order/%s/%s", orderType, orderID)
 
 	payload, err := json.Marshal(order)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to serialize modify order request")
-		return nil, err
+		return nil, fmt.Errorf("modify order %s serialize: %w", endpoint, err)
 	}
 
 	resp, err := c.request(endpoint, "PATCH", payload)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to modify order")
-		return nil, err
+		return nil, fmt.Errorf("modify order %s: %w", endpoint, err)
 	}
 
 	var result OrderResponse
 	if err := json.Unmarshal(resp, &result); err != nil {
 		log.Error().Err(err).Msg("Failed to parse modify order response")
-		return nil, err
+		return nil, fmt.Errorf("modify order %s decode: %w", endpoint, err)
 	}
 
 	if result.Status != "success" {
-		return nil, fmt.Errorf("order modification failed")
+		if result.ErrorCode != "" {
+			return nil, fmt.Errorf("order modification failed (status=%s, code=%s, message=%s)",
+				result.Status, result.ErrorCode, result.Message)
+		}
+		return nil, fmt.Errorf("order modification failed (status=%s, message=%s)", result.Status, result.Message)
+	}
+	if result.Data.OrderNo == "" {
+		return nil, fmt.Errorf("order modification failed: success response with empty orderNo")
 	}
 
 	c.debugf("Order modified successfully", func(e *zerolog.Event) {

@@ -1,7 +1,13 @@
-go.sum
-.env
-Makefile
-
-
-examples/*
-*.log
+# WAVE9-G (P1-159): wildcard env files (variants leak secrets); templates stay tracked.
+.env*
+!.env.example
+!.env.template
+# WAVE9-G (P1-030): track the upstream Makefile for reproducible builds.
+!Makefile
+# WAVE9-G (P1-160): keep example sources/docs/licenses versioned; ignore outputs only.
+examples/**/bin/
+examples/**/*.out
+!examples/**/README*
+!examples/**/LICENSE*
+# Build log outputs only (was blanket *.log at any depth).
+build/**/*.log
