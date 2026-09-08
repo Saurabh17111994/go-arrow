@@ -157,6 +157,10 @@ func (u *User) GetDefaultBankAccount() *BankDetail {
 // Returns:
 //   - bool: true if the user has access to the specified exchange
 func (u *User) HasExchangeAccess(exchange string) bool {
+	// P1-204: nil-receiver safe like the bank helpers above.
+	if u == nil || u.Data == nil {
+		return false
+	}
 	for _, ex := range u.Data.Exchanges {
 		if ex == exchange {
 			return true
@@ -170,5 +174,9 @@ func (u *User) HasExchangeAccess(exchange string) bool {
 // Returns:
 //   - bool: true if TOTP/2FA is enabled for the user account
 func (u *User) IsTotpEnabled() bool {
+	// P1-204: nil-receiver safe like the bank helpers above.
+	if u == nil || u.Data == nil {
+		return false
+	}
 	return u.Data.TotpEnabled
 }
