@@ -38,12 +38,60 @@ const (
 	TransactionTypeSell TransactionType = "S"
 )
 
+// WAVE9-G9 (P1-173): single-letter wire codes route delivery-vs-intraday
+// vs-F&O — validate SDK-side instead of failing broker-side on a typo.
+// (OrderRequest fields stay string-typed; ValidateOrderRequest enforces
+// validity/day-ioc/index/qty/price. Typed-enum migration deferred.)
+func (p Product) IsValid() bool {
+	switch p {
+	case ProductCNC, ProductMIS, ProductNRML:
+		return true
+	}
+	return false
+}
+
+func (t TransactionType) IsValid() bool {
+	switch t {
+	case TransactionTypeBuy, TransactionTypeSell:
+		return true
+	}
+	return false
+}
+
+func (e Exchange) IsValid() bool {
+	switch e {
+	case ExchangeNSE, ExchangeBSE, ExchangeNFO, ExchangeNCD, ExchangeBFO,
+		ExchangeBCD, ExchangeMCX, ExchangeNSESLBM, ExchangeINDEX:
+		return true
+	}
+	return false
+}
+
+func (o OrderType) IsValid() bool {
+	// P1-175: aliases share wire values with the canonical twins, so they
+	// cannot be distinct switch cases — compare against the four canonical
+	// encodings (string comparison covers both names of each pair).
+	switch string(o) {
+	case string(OrderTypeLimit), string(OrderTypeMarket),
+		string(OrderTypeSLLMT), string(OrderTypeSLMKT):
+		return true
+	}
+	return false
+}
+
+func (v Validity) IsValid() bool {
+	switch v {
+	case ValidityDAY, ValidityIOC, ValidityGTC:
+		return true
+	}
+	return false
+}
+
 // OrderType represents the type of order (limit, market, etc.).
 // R-240: the legacy constants no longer define a second wire encoding — a
 // stop-loss must be sent as one canonical value. The REST-doc encodings
 // (SL-LMT / SL-MKT) are authoritative; OrderTypeSL / OrderTypeSLM alias them
 // and are kept only as deprecated names.
-// Deprecated: use OrderTypeSLLMT / OrderTypeSLMKT.
 type OrderType string
 
 const (
@@ -51,8 +99,13 @@ const (
 	OrderTypeMarket OrderType = "MKT"    // Market order
 	OrderTypeSLLMT  OrderType = "SL-LMT" // Stop Loss Limit (REST docs — canonical)
 	OrderTypeSLMKT  OrderType = "SL-MKT" // Stop Loss Market (REST docs — canonical)
-	// Deprecated aliases — same wire value as the canonical constants above.
-	OrderTypeSL  OrderType = "SL-LMT"
+	// Deprecated aliases — same wire value as the canonical constants
+	// above (P1-175: indistinguishable at runtime; never use an alias and
+	// its canonical twin as distinct switch cases or map keys — they
+	// collide. Kept for wire-compat; removal needs a broker migration).
+	// Deprecated: use OrderTypeSLLMT instead.
+	OrderTypeSL OrderType = "SL-LMT"
+	// Deprecated: use OrderTypeSLMKT instead.
 	OrderTypeSLM OrderType = "SL-MKT"
 )
 
