@@ -11,7 +11,9 @@
 //
 //	client := arrow.NewClient(appID, appSecret)
 //	client.SetDebug(true) // optional
-//	err := client.AutoLogin(userID, password, totpSecret)
+//	if err := client.AutoLogin(userID, password, totpSecret); err != nil {
+//		log.Fatal(err)
+//	}
 //
 // API docs:
 //   - https://docs.arrow.trade/

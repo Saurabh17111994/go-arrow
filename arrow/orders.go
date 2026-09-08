@@ -4,6 +4,7 @@ package arrow
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/rs/zerolog"
@@ -19,7 +20,7 @@ type OrderRequest struct {
 	Symbol           string `json:"symbol"`                 // Trading symbol of the instrument.
 	TransactionType  string `json:"transactionType"`        // Order transaction type (BUY/SELL).
 	OrderType        string `json:"order"`                  // Type of order (e.g., MARKET, LIMIT).
-	Price            string `json:"price"`                  // Order price (applicable for LIMIT orders).
+	Price            string `json:"price,omitempty"`        // Order price (LIMIT; omitted for MARKET — WAVE9-F P1-189).
 	Validity         string `json:"validity"`               // Order validity (e.g., DAY, IOC).
 	Remarks          string `json:"remarks,omitempty"`      // Custom Remarks for order tracking (optional).
 	MarketProtection bool   `json:"mpp"`                    // Market protection flag; defaults to false when not set.
@@ -80,43 +81,12 @@ type OrderDetails struct {
 	LeavesQuantity     string `json:"leavesQuantity"`     // Remaining quantity yet to be executed.
 }
 
+// OrderDetailsResponse is the /order/{orderID} envelope. (WAVE9-F: P1-190 —
+// the duplicate 34-field anonymous struct drifted from OrderDetails; Data is
+// now the canonical OrderDetails so both stay in sync.)
 type OrderDetailsResponse struct {
-	Data []struct {
-		Status             string `json:"status"`
-		Exchange           string `json:"exchange"`
-		Symbol             string `json:"symbol"`
-		ID                 string `json:"id"`
-		Price              string `json:"price"`
-		Quantity           string `json:"quantity"`
-		Product            string `json:"product"`
-		OrderStatus        string `json:"orderStatus"`
-		ReportType         string `json:"reportType"`
-		TransactionType    string `json:"transactionType"`
-		Order              string `json:"order"`
-		FillShares         string `json:"fillShares"`
-		AveragePrice       string `json:"averagePrice"`
-		RejectReason       string `json:"rejectReason"`
-		ExchangeOrderID    string `json:"exchangeOrderID"`
-		CancelQuantity     string `json:"cancelQuantity"`
-		Remarks            string `json:"remarks"`
-		DisclosedQuantity  string `json:"disclosedQuantity"`
-		OrderTriggerPrice  string `json:"orderTriggerPrice"`
-		Retention          string `json:"retention"`
-		BookProfitPrice    string `json:"bookProfitPrice"`
-		BookLossPrice      string `json:"bookLossPrice"`
-		TrailingPrice      string `json:"trailingPrice"`
-		Amo                string `json:"amo"`
-		PricePrecision     string `json:"pricePrecision"`
-		TickSize           string `json:"tickSize"`
-		LotSize            string `json:"lotSize"`
-		Token              string `json:"token"`
-		TimeStamp          string `json:"timeStamp"`
-		OrderTime          string `json:"orderTime"`
-		ExchangeUpdateTime string `json:"exchangeUpdateTime"`
-		RequestTime        string `json:"requestTime"`
-		ErrorMessage       string `json:"errorMessage"`
-	} `json:"data"`
-	Status string `json:"status"`
+	Data   []OrderDetails `json:"data"`
+	Status string         `json:"status"`
 }
 
 // OrderBookResponse represents the API response structure for the order book.
@@ -126,6 +96,20 @@ type OrderDetailsResponse struct {
 type OrderBookResponse struct {
 	Data   []OrderDetails `json:"data"`   // Array of OrderDetails objects representing all user orders.
 	Status string         `json:"status"` // API response status indicating success or failure.
+}
+
+// RequireSuccess rejects unknown status values instead of zero-value
+// accepting them (mirrors GenericResponse.RequireSuccess for the concrete
+// order-book envelope).
+func (r OrderBookResponse) RequireSuccess(op string) error {
+	switch r.Status {
+	case "success":
+		return nil
+	case "error", "":
+		return fmt.Errorf("%s failed with status: %s", op, r.Status)
+	default:
+		return fmt.Errorf("%s failed: unknown status %q", op, r.Status)
+	}
 }
 
 // Trade is a single execution line from the trade book (/user/trades).
@@ -350,6 +334,25 @@ func (c *Client) ModifyOrder(orderType, orderID string, order OrderRequest) (*Or
 	return &result, nil
 }
 
+// validateOrderPath rejects empty or path-hostile orderType/orderID before
+// interpolation into the URL path. (WAVE9-F: P1-191/193.)
+func validateOrderPath(op, orderType, orderID string) (string, error) {
+	if strings.TrimSpace(orderType) == "" {
+		return "", fmt.Errorf("%s: empty order variety", op)
+	}
+	if strings.ContainsAny(orderType, "/?#") {
+		return "", fmt.Errorf("%s: invalid order variety %q", op, orderType)
+	}
+	if strings.TrimSpace(orderID) == "" {
+		return "", fmt.Errorf("%s: empty orderID", op)
+	}
+	if strings.ContainsAny(orderID, "/?#") {
+		return "", fmt.Errorf("%s: invalid orderID %q", op, orderID)
+	}
+	return fmt.Sprintf("/order/%s/%s",
+		url.PathEscape(orderType), url.PathEscape(orderID)), nil
+}
+
 // CancelOrder cancels an existing order.
 //
 // It sends a DELETE request to the API endpoint "/order/{variety}/{orderID}".
@@ -361,28 +364,36 @@ func (c *Client) ModifyOrder(orderType, orderID string, order OrderRequest) (*Or
 // Returns:
 //   - An error if the cancellation fails; otherwise, nil.
 func (c *Client) CancelOrder(orderType, orderID string) error {
-	endpoint := fmt.Sprintf("/order/%s/%s", orderType, orderID)
+	endpoint, err := validateOrderPath("order cancel", orderType, orderID)
+	if err != nil {
+		return err
+	}
 
 	resp, err := c.request(endpoint, "DELETE", nil)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to cancel order")
-		return err
+		return fmt.Errorf("order cancel %s: %w", endpoint, err)
 	}
 
 	var result struct {
-		Status string `json:"status"`
-		Data   struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+		Data    struct {
 			Message string `json:"message"`
 		} `json:"data"`
 	}
 
 	if err := json.Unmarshal(resp, &result); err != nil {
 		log.Error().Err(err).Msg("Failed to parse cancel order response")
-		return err
+		return fmt.Errorf("order cancel %s decode: %w (body=%.200s)", endpoint, err, string(resp))
 	}
 
 	if result.Status != "success" {
-		return fmt.Errorf("order cancellation failed")
+		msg := result.Message
+		if msg == "" {
+			msg = result.Data.Message
+		}
+		return apiError("order cancel", result.Status, resp)
 	}
 
 	c.debugf("Order cancelled successfully", func(e *zerolog.Event) {
@@ -396,15 +407,15 @@ func (c *Client) CancelAllOrders() error {
 	resp, err := c.request("/user/orders", "DELETE", nil)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to cancel all orders")
-		return err
+		return fmt.Errorf("cancel all orders: %w", err)
 	}
 	var result GenericResponse[map[string]any]
 	if err := json.Unmarshal(resp, &result); err != nil {
 		log.Error().Err(err).Msg("Failed to parse cancel all orders response")
-		return err
+		return fmt.Errorf("cancel all orders decode: %w (body=%.200s)", err, string(resp))
 	}
-	if result.Status != "success" {
-		return fmt.Errorf("cancel all orders failed with status: %s", result.Status)
+	if err := result.RequireSuccess("cancel all orders"); err != nil {
+		return apiError("cancel all orders", result.Status, resp)
 	}
 	c.debugf("All orders cancelled successfully", nil)
 	return nil
@@ -416,27 +427,30 @@ func (c *Client) CancelAllOrders() error {
 //
 // Parameters:
 //   - orderID: Unique identifier of the order.
-//
-// Returns:
-//   - A pointer to OrderDetailsResponse containing order details if successful.
-//   - An error if the retrieval fails.
 func (c *Client) GetOrder(orderID string) (*OrderDetailsResponse, error) {
-	endpoint := fmt.Sprintf("/order/%s", orderID)
+	// WAVE9-F (P1-190/191): canonical OrderDetails shape + path guard.
+	if strings.TrimSpace(orderID) == "" {
+		return nil, fmt.Errorf("order details: empty orderID")
+	}
+	if strings.ContainsAny(orderID, "/?#") {
+		return nil, fmt.Errorf("order details: invalid orderID %q", orderID)
+	}
+	endpoint := fmt.Sprintf("/order/%s", url.PathEscape(orderID))
 
 	resp, err := c.request(endpoint, "GET", nil)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to get order details")
-		return nil, err
+		return nil, fmt.Errorf("order details %s: %w", endpoint, err)
 	}
 
 	var result OrderDetailsResponse
 	if err := json.Unmarshal(resp, &result); err != nil {
 		log.Error().Err(err).Msg("Failed to parse order details response")
-		return nil, err
+		return nil, fmt.Errorf("order details %s decode: %w (body=%.200s)", endpoint, err, string(resp))
 	}
 
 	if result.Status != "success" {
-		return nil, fmt.Errorf("failed to retrieve order details")
+		return nil, apiError("order details", result.Status, resp)
 	}
 
 	c.debugf("Order details retrieved successfully", func(e *zerolog.Event) {
@@ -445,8 +459,6 @@ func (c *Client) GetOrder(orderID string) (*OrderDetailsResponse, error) {
 	return &result, nil
 }
 
-// GetOrderBook retrieves all orders for the current trading day.
-//
 // This method sends a GET request to the "/user/orders" endpoint to fetch
 // comprehensive order data including current orders, historical orders,
 // execution details, and order status information.
@@ -480,21 +492,26 @@ func (c *Client) GetOrderBook() ([]OrderDetails, error) {
 	resp, err := c.request(endpoint, "GET", nil)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to fetch order book")
-		return nil, err
+		return nil, fmt.Errorf("order book: %w", err)
 	}
 
 	var result OrderBookResponse
 	// Parse the JSON response into the OrderBookResponse struct.
 	if err := json.Unmarshal(resp, &result); err != nil {
 		log.Error().Err(err).Msg("Failed to parse order book response")
-		return nil, err
+		return nil, fmt.Errorf("order book decode: %w (body=%.200s)", err, string(resp))
 	}
 
 	// Check if the API response status indicates success.
-	if result.Status != "success" {
-		return nil, fmt.Errorf("order book retrieval failed with status: %s", result.Status)
+	if err := result.RequireSuccess("order book"); err != nil {
+		return nil, apiError("order book", result.Status, resp)
 	}
 
+	// WAVE9-F (P1-190): canonical OrderDetails everywhere — data:null
+	// success returns empty, never (nil,nil).
+	if result.Data == nil {
+		return []OrderDetails{}, nil
+	}
 	c.debugf("Order book retrieved successfully", func(e *zerolog.Event) {
 		e.Int("count", len(result.Data))
 	})
@@ -506,15 +523,18 @@ func (c *Client) GetTradeBook() ([]Trade, error) {
 	resp, err := c.request("/user/trades", "GET", nil)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to fetch trade book")
-		return nil, err
+		return nil, fmt.Errorf("trade book: %w", err)
 	}
 	var result GenericResponse[[]Trade]
 	if err := json.Unmarshal(resp, &result); err != nil {
 		log.Error().Err(err).Msg("Failed to parse trade book response")
-		return nil, err
+		return nil, fmt.Errorf("trade book decode: %w (body=%.200s)", err, string(resp))
 	}
-	if result.Status != "success" {
-		return nil, fmt.Errorf("trade book retrieval failed with status: %s", result.Status)
+	if err := result.RequireSuccess("trade book"); err != nil {
+		return nil, apiError("trade book", result.Status, resp)
+	}
+	if result.Data == nil {
+		return []Trade{}, nil
 	}
 	c.debugf("Trade book retrieved successfully", func(e *zerolog.Event) {
 		e.Int("count", len(result.Data))

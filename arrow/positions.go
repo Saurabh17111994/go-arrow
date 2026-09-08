@@ -2,6 +2,7 @@
 package arrow
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
@@ -15,48 +16,48 @@ import (
 // including quantity details, pricing information, profit/loss calculations,
 // and various trading metrics for both current day and carry-forward transactions.
 type Position struct {
-	UserID                   string `json:"userID"`                   // Unique identifier for the user holding the position.
-	AccountID                string `json:"accountID"`                // Account ID associated with the position.
-	Token                    string `json:"token"`                    // Unique token identifier for the trading instrument.
-	Exchange                 string `json:"exchange"`                 // Name of the exchange where the instrument is traded (e.g., NSE, BSE).
-	Symbol                   string `json:"symbol"`                   // Trading symbol of the instrument (e.g., RELIANCE, TCS).
-	Segment                  string `json:"segment"`                  // Segment code (e.g., CM, FO, MCX).
-	Product                  string `json:"product"`                  // Product type (e.g., MIS, CNC, NRML).
-	Qty                      string `json:"qty"`                      // Net quantity of the position (positive for long, negative for short).
-	AvgPrice                 string `json:"avgPrice"`                 // Average price at which the position was acquired.
-	DayBuyQty                string `json:"dayBuyQty"`                // Quantity bought during the current trading day.
-	DaySellQty               string `json:"daySellQty"`               // Quantity sold during the current trading day.
-	DayBuyAmount             string `json:"dayBuyAmount"`             // Total amount spent on buying during the current day.
-	DayBuyAvgPrice           string `json:"dayBuyAvgPrice"`           // Average price of buy transactions for the current day.
-	DaySellAmount            string `json:"daySellAmount"`            // Total amount received from selling during the current day.
-	DaySellAvgPrice          string `json:"daySellAvgPrice"`          // Average price of sell transactions for the current day.
-	CarryForwardBuyQty       string `json:"carryForwardBuyQty"`       // Quantity bought and carried forward from previous sessions.
-	CarryForwardSellQty      string `json:"carryForwardSellQty"`      // Quantity sold and carried forward from previous sessions.
-	CarryForwardBuyAmount    string `json:"carryForwardBuyAmount"`    // Total amount of carried forward buy transactions.
-	CarryForwardBuyAvgPrice  string `json:"carryForwardBuyAvgPrice"`  // Average price of carried forward buy transactions.
-	CarryForwardSellAmount   string `json:"carryForwardSellAmount"`   // Total amount of carried forward sell transactions.
-	CarryForwardSellAvgPrice string `json:"carryForwardSellAvgPrice"` // Average price of carried forward sell transactions.
-	CarryForwardAvgPrice     string `json:"carryForwardAvgPrice"`     // Average price of all carried forward transactions.
-	Ltp                      string `json:"ltp"`                      // Last traded price of the instrument (paise).
-	Close                    string `json:"close"`                    // Previous close (paise).
-	OptionType               string `json:"optionType"`               // Option type when applicable (CE/PE).
-	RealisedPnL              string `json:"realisedPnL"`              // Realized profit and loss from closed positions.
-	UnrealisedMarkToMarket   string `json:"unrealisedMarkToMarket"`   // Unrealized profit and loss based on current market price.
-	BreakEvenPrice           string `json:"breakEvenPrice"`           // Price at which the position would break even.
-	OpenBuyQty               string `json:"openBuyQty"`               // Outstanding buy quantity yet to be settled.
-	OpenSellQty              string `json:"openSellQty"`              // Outstanding sell quantity yet to be settled.
-	OpenBuyAmount            string `json:"openBuyAmount"`            // Total amount of outstanding buy transactions.
-	OpenSellAmount           string `json:"openSellAmount"`           // Total amount of outstanding sell transactions.
-	OpenBuyAvgPrice          string `json:"openBuyAvgPrice"`          // Average price of outstanding buy transactions.
-	OpenSellAvgPrice         string `json:"openSellAvgPrice"`         // Average price of outstanding sell transactions.
-	Multiplier               string `json:"multiplier"`               // Contract multiplier for derivative instruments.
-	PricePrecision           string `json:"pricePrecision"`           // Number of decimal places for price precision.
-	PriceFactor              string `json:"priceFactor"`              // Factor used for price calculations.
-	TickSize                 string `json:"tickSize"`                 // Minimum price movement allowed for the instrument.
-	LotSize                  string `json:"lotSize"`                  // Minimum trading quantity for the instrument.
-	UploadPrice              string `json:"uploadPrice"`              // Price used for position upload calculations.
-	NetUploadPrice           string `json:"netUploadPrice"`           // Net price after adjustments for upload calculations.
-	RequestTime              string `json:"requestTime"`              // Timestamp when the position data was requested.
+	UserID                   string     `json:"userID"`                   // Unique identifier for the user holding the position.
+	AccountID                string     `json:"accountID"`                // Account ID associated with the position.
+	Token                    FlexString `json:"token"`                    // Unique token identifier for the trading instrument.
+	Exchange                 string     `json:"exchange"`                 // Name of the exchange where the instrument is traded (e.g., NSE, BSE).
+	Symbol                   string     `json:"symbol"`                   // Trading symbol of the instrument (e.g., RELIANCE, TCS).
+	Segment                  string     `json:"segment"`                  // Segment code (e.g., CM, FO, MCX).
+	Product                  string     `json:"product"`                  // Product type (e.g., MIS, CNC, NRML).
+	Qty                      FlexString `json:"qty"`                      // Net quantity of the position (positive for long, negative for short).
+	AvgPrice                 FlexString `json:"avgPrice"`                 // Average price at which the position was acquired.
+	DayBuyQty                FlexString `json:"dayBuyQty"`                // Quantity bought during the current trading day.
+	DaySellQty               FlexString `json:"daySellQty"`               // Quantity sold during the current trading day.
+	DayBuyAmount             FlexString `json:"dayBuyAmount"`             // Total amount spent on buying during the current day.
+	DayBuyAvgPrice           FlexString `json:"dayBuyAvgPrice"`           // Average price of buy transactions for the current day.
+	DaySellAmount            FlexString `json:"daySellAmount"`            // Total amount received from selling during the current day.
+	DaySellAvgPrice          FlexString `json:"daySellAvgPrice"`          // Average price of sell transactions for the current day.
+	CarryForwardBuyQty       FlexString `json:"carryForwardBuyQty"`       // Quantity bought and carried forward from previous sessions.
+	CarryForwardSellQty      FlexString `json:"carryForwardSellQty"`      // Quantity sold and carried forward from previous sessions.
+	CarryForwardBuyAmount    FlexString `json:"carryForwardBuyAmount"`    // Total amount of carried forward buy transactions.
+	CarryForwardBuyAvgPrice  FlexString `json:"carryForwardBuyAvgPrice"`  // Average price of carried forward buy transactions.
+	CarryForwardSellAmount   FlexString `json:"carryForwardSellAmount"`   // Total amount of carried forward sell transactions.
+	CarryForwardSellAvgPrice FlexString `json:"carryForwardSellAvgPrice"` // Average price of carried forward sell transactions.
+	CarryForwardAvgPrice     FlexString `json:"carryForwardAvgPrice"`     // Average price of all carried forward transactions.
+	Ltp                      FlexString `json:"ltp"`                      // Last traded price of the instrument (paise).
+	Close                    FlexString `json:"close"`                    // Previous close (paise).
+	OptionType               string     `json:"optionType"`               // Option type when applicable (CE/PE).
+	RealisedPnL              FlexString `json:"realisedPnL"`              // Realized profit and loss from closed positions.
+	UnrealisedMarkToMarket   FlexString `json:"unrealisedMarkToMarket"`   // Unrealized profit and loss based on current market price.
+	BreakEvenPrice           FlexString `json:"breakEvenPrice"`           // Price at which the position would break even.
+	OpenBuyQty               FlexString `json:"openBuyQty"`               // Outstanding buy quantity yet to be settled.
+	OpenSellQty              FlexString `json:"openSellQty"`              // Outstanding sell quantity yet to be settled.
+	OpenBuyAmount            FlexString `json:"openBuyAmount"`            // Total amount of outstanding buy transactions.
+	OpenSellAmount           FlexString `json:"openSellAmount"`           // Total amount of outstanding sell transactions.
+	OpenBuyAvgPrice          FlexString `json:"openBuyAvgPrice"`          // Average price of outstanding buy transactions.
+	OpenSellAvgPrice         FlexString `json:"openSellAvgPrice"`         // Average price of outstanding sell transactions.
+	Multiplier               FlexString `json:"multiplier"`               // Contract multiplier for derivative instruments.
+	PricePrecision           FlexString `json:"pricePrecision"`           // Number of decimal places for price precision.
+	PriceFactor              FlexString `json:"priceFactor"`              // Factor used for price calculations.
+	TickSize                 FlexString `json:"tickSize"`                 // Minimum price movement allowed for the instrument.
+	LotSize                  FlexString `json:"lotSize"`                  // Minimum trading quantity for the instrument.
+	UploadPrice              FlexString `json:"uploadPrice"`              // Price used for position upload calculations.
+	NetUploadPrice           FlexString `json:"netUploadPrice"`           // Net price after adjustments for upload calculations.
+	RequestTime              string     `json:"requestTime"`              // Timestamp when the position data was requested.
 }
 
 // PositionsResponse represents the API response structure for user positions.
@@ -66,6 +67,40 @@ type Position struct {
 type PositionsResponse struct {
 	Data   []Position `json:"data"`   // Array of Position objects representing all user positions.
 	Status string     `json:"status"` // API response status indicating success or failure.
+}
+
+// FlexString accepts the mixed string/number wire shapes the broker emits
+// for qty/price/pnl-style fields (portfolio sample shows integer strings
+// like "14675"; quote.go shows numeric ints for the same concepts).
+// (WAVE9-E: P1-044 — `cannot unmarshal number into Go value of type string`
+// previously failed the whole fetch on numeric JSON.)
+type FlexString string
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (f *FlexString) UnmarshalJSON(b []byte) error {
+	if string(b) == "null" {
+		*f = ""
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		*f = FlexString(s)
+		return nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(b, &n); err == nil {
+		*f = FlexString(n.String())
+		return nil
+	}
+	var fl float64
+	if err := json.Unmarshal(b, &fl); err == nil {
+		*f = FlexString(json.Number(fmt.Sprintf("%v", fl)).String())
+		return nil
+	}
+	if len(b) > 80 {
+		return fmt.Errorf("flexstring: unsupported JSON shape %s...", string(b[:80]))
+	}
+	return fmt.Errorf("flexstring: unsupported JSON shape %s", string(b))
 }
 
 // GetPositions retrieves all trading positions for the authenticated user.
@@ -105,18 +140,47 @@ func (c *Client) GetPositions() ([]Position, error) {
 
 	var result PositionsResponse
 	// Parse the JSON response into the PositionsResponse struct.
+	// (WAVE9-E: P1-044 — all money/qty fields are FlexString so numeric or
+	// string JSON both decode; P1-299 GetPositionsContext wraps this.)
 	if err := json.Unmarshal(resp, &result); err != nil {
 		log.Error().Err(err).Msg("Failed to parse positions response")
-		return nil, err
+		return nil, fmt.Errorf("positions: decode: %w (body=%.200s)", err, string(resp))
 	}
 
 	// Check if the API response status indicates success.
 	if result.Status != "success" {
-		return nil, fmt.Errorf("positions retrieval failed with status: %s", result.Status)
+		return nil, apiError("positions", result.Status, resp)
 	}
 
+	// WAVE9-F (P1-195): data:null success must not return (nil,nil) — the old
+	// nil slice + nil error was indistinguishable from "no data at all".
+	if result.Data == nil {
+		return []Position{}, nil
+	}
 	c.debugf("Positions retrieved successfully", func(e *zerolog.Event) {
 		e.Int("count", len(result.Data))
 	})
 	return result.Data, nil
+}
+
+// GetPositionsContext is GetPositions honoring ctx cancellation before the
+// round-trip. (WAVE9-E: P1-299.)
+func (c *Client) GetPositionsContext(ctx context.Context, out *[]Position) error {
+	if ctx == nil {
+		return fmt.Errorf("positions: nil context")
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	pos, err := c.GetPositions()
+	if err != nil {
+		return err
+	}
+	if out == nil {
+		return fmt.Errorf("positions: nil destination")
+	}
+	*out = pos
+	return nil
 }

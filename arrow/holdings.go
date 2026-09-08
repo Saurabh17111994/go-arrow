@@ -27,23 +27,23 @@ type Symbol struct {
 // pricing information, profit/loss calculations, and various quantity classifications
 // that determine trading eligibility and collateral usage.
 type Holding struct {
-	Symbols             []Symbol `json:"symbols"`             // Array of symbol information for the holding across different exchanges.
-	AvgPrice            string   `json:"avgPrice"`            // Average price at which the holding was acquired.
-	Qty                 string   `json:"qty"`                 // Total quantity of the holding owned by the user.
-	UsedQty             string   `json:"usedQty"`             // Quantity currently used as collateral or margin.
-	T1Qty               string   `json:"t1Qty"`               // Quantity in T1 (Trade day + 1) settlement cycle, available for trading next day.
-	DepositoryQty       string   `json:"depositoryQty"`       // Quantity held in the depository (NSDL/CDSL) and available for trading.
-	CollateralQty       string   `json:"collateralQty"`       // Quantity pledged as collateral for margin requirements.
-	BrokerCollateralQty string   `json:"brokerCollateralQty"` // Quantity pledged with the broker for additional margin benefits.
-	AuthorizedQty       string   `json:"authorizedQty"`       // Total authorized quantity including all categories.
-	UnPledgedQty        string   `json:"unPledgedQty"`        // Quantity not pledged as collateral and available for free trading.
-	NonPOAQty           string   `json:"nonPOAQty"`           // Quantity for which Power of Attorney (POA) is not provided.
-	Haircut             string   `json:"haircut"`             // Haircut percentage applied to the holding value for margin calculations.
-	EffectiveQty        string   `json:"effectiveQty"`        // Effective quantity after applying haircuts and margin requirements.
-	SellableQty         string   `json:"sellableQty"`         // Quantity available for immediate selling in the market.
-	Ltp                 string   `json:"ltp"`                 // Last traded price of the instrument.
-	Pnl                 string   `json:"pnl"`                 // Profit and loss calculated based on current market price vs average price.
-	Close               string   `json:"close"`               // Previous day's closing price of the instrument.
+	Symbols             []Symbol   `json:"symbols"`             // Array of symbol information for the holding across different exchanges.
+	AvgPrice            FlexString `json:"avgPrice"`            // Average price at which the holding was acquired.
+	Qty                 FlexString `json:"qty"`                 // Total quantity of the holding owned by the user.
+	UsedQty             FlexString `json:"usedQty"`             // Quantity currently used as collateral or margin.
+	T1Qty               FlexString `json:"t1Qty"`               // Quantity in T1 (Trade day + 1) settlement cycle, available for trading next day.
+	DepositoryQty       FlexString `json:"depositoryQty"`       // Quantity held in the depository (NSDL/CDSL) and available for trading.
+	CollateralQty       FlexString `json:"collateralQty"`       // Quantity pledged as collateral for margin requirements.
+	BrokerCollateralQty FlexString `json:"brokerCollateralQty"` // Quantity pledged with the broker for additional margin benefits.
+	AuthorizedQty       FlexString `json:"authorizedQty"`       // Total authorized quantity including all categories.
+	UnPledgedQty        FlexString `json:"unPledgedQty"`        // Quantity not pledged as collateral and available for free trading.
+	NonPOAQty           FlexString `json:"nonPOAQty"`           // Quantity for which Power of Attorney (POA) is not provided.
+	Haircut             FlexString `json:"haircut"`             // Haircut percentage applied to the holding value for margin calculations.
+	EffectiveQty        FlexString `json:"effectiveQty"`        // Effective quantity after applying haircuts and margin requirements.
+	SellableQty         FlexString `json:"sellableQty"`         // Quantity available for immediate selling in the market.
+	Ltp                 FlexString `json:"ltp"`                 // Last traded price of the instrument.
+	Pnl                 FlexString `json:"pnl"`                 // Profit and loss calculated based on current market price vs average price.
+	Close               FlexString `json:"close"`               // Previous day's closing price of the instrument.
 }
 
 // HoldingsResponse represents the API response structure for user holdings.
@@ -103,14 +103,16 @@ func (c *Client) GetHoldings() ([]Holding, error) {
 
 	var result HoldingsResponse
 	// Parse the JSON response into the HoldingsResponse struct.
+	// (WAVE9-F: P1-179 — money/qty fields are FlexString so numeric or
+	// string JSON both decode; decode failures carry a body excerpt.)
 	if err := json.Unmarshal(resp, &result); err != nil {
 		log.Error().Err(err).Msg("Failed to parse holdings response")
-		return nil, err
+		return nil, fmt.Errorf("holdings: decode: %w (body=%.200s)", err, string(resp))
 	}
 
 	// Check if the API response status indicates success.
 	if result.Status != "success" {
-		return nil, fmt.Errorf("holdings retrieval failed with status: %s", result.Status)
+		return nil, apiError("holdings", result.Status, resp)
 	}
 
 	c.debugf("Holdings retrieved successfully", func(e *zerolog.Event) {

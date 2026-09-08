@@ -35,6 +35,11 @@ type BasketMarginRequest struct {
 }
 
 func (c *Client) GetBasketMargin(req BasketMarginRequest) (map[string]any, error) {
+	// WAVE9-F (P1-185): nil Orders marshals to "orders":null which strict
+	// servers reject — normalize to [] before touching the wire.
+	if req.Orders == nil {
+		req.Orders = []MarginRequest{}
+	}
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
@@ -47,8 +52,8 @@ func (c *Client) GetBasketMargin(req BasketMarginRequest) (map[string]any, error
 	if err := json.Unmarshal(resp, &result); err != nil {
 		return nil, err
 	}
-	if result.Status != "success" {
-		return nil, fmt.Errorf("basket margin failed with status: %s", result.Status)
+	if err := result.RequireSuccess("basket margin"); err != nil {
+		return nil, apiError("basket margin", result.Status, resp)
 	}
 	if result.Data == nil {
 		return map[string]any{}, nil
@@ -56,9 +61,11 @@ func (c *Client) GetBasketMargin(req BasketMarginRequest) (map[string]any, error
 	return result.Data, nil
 }
 
-// GetGreeks posts an array of instrument tokens to /info/greeks.
-// The server may return 400 when Greeks are unavailable for the given tokens.
 func (c *Client) GetGreeks(tokens []int) (json.RawMessage, error) {
+	// WAVE9-F (P1-186): nil slice marshals to body `null` — normalize to [].
+	if tokens == nil {
+		tokens = []int{}
+	}
 	payload, err := json.Marshal(tokens)
 	if err != nil {
 		return nil, err
@@ -71,8 +78,11 @@ func (c *Client) GetGreeks(tokens []int) (json.RawMessage, error) {
 	if err := json.Unmarshal(resp, &result); err != nil {
 		return nil, err
 	}
-	if result.Status != "success" {
-		return nil, fmt.Errorf("greeks retrieval failed with status: %s", result.Status)
+	if err := result.RequireSuccess("greeks"); err != nil {
+		return nil, apiError("greeks", result.Status, resp)
+	}
+	if len(result.Data) == 0 || string(result.Data) == "null" {
+		return json.RawMessage("[]"), nil
 	}
 	return result.Data, nil
 }
@@ -97,8 +107,11 @@ func (c *Client) GetOptionChain(req OptionChainRequest) (json.RawMessage, error)
 	if err := json.Unmarshal(resp, &result); err != nil {
 		return nil, err
 	}
-	if result.Status != "success" {
-		return nil, fmt.Errorf("option chain retrieval failed with status: %s", result.Status)
+	if err := result.RequireSuccess("option chain"); err != nil {
+		return nil, apiError("option chain", result.Status, resp)
+	}
+	if len(result.Data) == 0 || string(result.Data) == "null" {
+		return json.RawMessage("[]"), nil
 	}
 	return result.Data, nil
 }
@@ -118,8 +131,8 @@ func (c *Client) GetAllOptionChainSymbols() (OptionChainSymbolsByCategory, error
 	if err := json.Unmarshal(resp, &result); err != nil {
 		return nil, err
 	}
-	if result.Status != "success" {
-		return nil, fmt.Errorf("option chain symbols retrieval failed with status: %s", result.Status)
+	if err := result.RequireSuccess("option chain symbols"); err != nil {
+		return nil, apiError("option chain symbols", result.Status, resp)
 	}
 	if result.Data == nil {
 		return OptionChainSymbolsByCategory{}, nil
@@ -129,7 +142,7 @@ func (c *Client) GetAllOptionChainSymbols() (OptionChainSymbolsByCategory, error
 
 // HolidaysData is the object under "data" for GET /info/holidays.
 type HolidaysData struct {
-	Holidays           map[string]string    `json:"holidays"`
+	Holidays           map[string]string          `json:"holidays"`
 	SpecialTradingDays map[string]json.RawMessage `json:"specialTradingDays"`
 }
 
@@ -142,8 +155,8 @@ func (c *Client) GetHolidays() (*HolidaysData, error) {
 	if err := json.Unmarshal(resp, &result); err != nil {
 		return nil, err
 	}
-	if result.Status != "success" {
-		return nil, fmt.Errorf("holiday retrieval failed with status: %s", result.Status)
+	if err := result.RequireSuccess("holidays"); err != nil {
+		return nil, apiError("holidays", result.Status, resp)
 	}
 	return &result.Data, nil
 }
@@ -157,8 +170,13 @@ func (c *Client) GetIndexList() ([]map[string]any, error) {
 	if err := json.Unmarshal(resp, &result); err != nil {
 		return nil, err
 	}
-	if result.Status != "success" {
-		return nil, fmt.Errorf("index list retrieval failed with status: %s", result.Status)
+	if err := result.RequireSuccess("index list"); err != nil {
+		return nil, apiError("index list", result.Status, resp)
+	}
+	// WAVE9-F (P1-298): nil slice on data:null success — return non-nil
+	// empty so callers can distinguish success-empty from failure.
+	if result.Data == nil {
+		return []map[string]any{}, nil
 	}
 	return result.Data, nil
 }
@@ -182,6 +200,16 @@ func (c *Client) GetInstrumentsCSV(segment InstrumentSegment) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// WAVE9-F (P1-041): 200-with-error bodies (JSON/HTML) must not become a
+	// 1-row CSV success — sniff before CSV parsing.
+	trimmed := bytes.TrimSpace(resp)
+	if len(trimmed) == 0 {
+		return "", fmt.Errorf("instruments %q: empty body", string(segment))
+	}
+	switch trimmed[0] {
+	case '{', '[', '<':
+		return "", apiError("instruments "+string(segment), "error", trimmed)
+	}
 	return string(resp), nil
 }
 
@@ -190,8 +218,24 @@ func (c *Client) GetInstruments(segment InstrumentSegment) ([][]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	// WAVE9-F (P1-187): never parse an error page as CSV rows; drop the
+	// header row so it is not mistaken for data.
+	trimmed := strings.TrimSpace(csvText)
+	if trimmed == "" {
+		return nil, fmt.Errorf("instruments %q: empty CSV", string(segment))
+	}
+	if trimmed[0] == '{' || trimmed[0] == '[' || trimmed[0] == '<' {
+		return nil, apiError("instruments "+string(segment), "error", []byte(trimmed))
+	}
 	r := csv.NewReader(strings.NewReader(csvText))
-	return r.ReadAll()
+	rows, err := r.ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("instruments %q: csv parse: %w", string(segment), err)
+	}
+	if len(rows) > 0 {
+		rows = rows[1:]
+	}
+	return rows, nil
 }
 
 // GetCandleData calls the Historical Data API (GET /candle/:exchange/:token/:interval).
@@ -201,7 +245,12 @@ func (c *Client) GetInstruments(segment InstrumentSegment) ([][]string, error) {
 // that means the exchange/token pair is not recognised (wrong segment or expired derivatives token), not a client-side parse error.
 // See https://docs.arrow.trade/rest-api/historical-candle-data/
 func (c *Client) GetCandleData(exchange Exchange, token, interval, fromTimestamp, toTimestamp string, oi bool) (json.RawMessage, error) {
-	base := "https://historical-api.arrow.trade"
+	// WAVE9-F (P1-188): empty base yields a host-less URI and a
+	// trailing-slash base yields "//candle/..." — fail fast instead.
+	base := strings.TrimSuffix(strings.TrimSpace(c.Config.HistoricalBaseURL), "/")
+	if base == "" {
+		return nil, fmt.Errorf("candle data: missing HistoricalBaseURL")
+	}
 	q := url.Values{}
 	q.Set("from", fromTimestamp)
 	q.Set("to", toTimestamp)
@@ -213,5 +262,38 @@ func (c *Client) GetCandleData(exchange Exchange, token, interval, fromTimestamp
 	if err != nil {
 		return nil, err
 	}
-	return json.RawMessage(bytes.TrimSpace(resp)), nil
+	// WAVE9-F (P1-042): success is a bare JSON array — reject error
+	// envelopes and non-array bodies instead of returning them as candles.
+	trimmed := bytes.TrimSpace(resp)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("candle data: empty body")
+	}
+	if trimmed[0] != '[' {
+		return nil, apiError("candle data", "error", trimmed)
+	}
+	return json.RawMessage(trimmed), nil
+}
+
+// apiError builds a descriptive error for a non-success API response:
+// it parses the server's errorMessage/errorCode fields so operators see the
+// real rejection reason instead of a bare status string.
+func apiError(op, status string, resp []byte) error {
+	var envelope struct {
+		ErrorMessage string `json:"errorMessage"`
+		ErrorCode    string `json:"errorCode"`
+		Message      string `json:"message"`
+	}
+	_ = json.Unmarshal(resp, &envelope) // best-effort; keep the status on failure
+	msg := envelope.ErrorMessage
+	if msg == "" {
+		msg = envelope.Message
+	}
+	if msg == "" {
+		return fmt.Errorf("%s failed with status: %s", op, status)
+	}
+	if envelope.ErrorCode != "" {
+		return fmt.Errorf("%s failed with status: %s, code: %s, message: %s",
+			op, status, envelope.ErrorCode, msg)
+	}
+	return fmt.Errorf("%s failed with status: %s, message: %s", op, status, msg)
 }

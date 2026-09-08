@@ -25,18 +25,25 @@ type QuoteInstrument struct {
 	Symbol   string `json:"symbol"`
 }
 
-// QuoteRequest is kept for documentation compatibility; do not set Mode — it is omitted from JSON.
+// QuoteRequest is kept for documentation compatibility; Mode is never sent
+// (the mode travels in the URL path /info/quotes/{mode}). (WAVE9-F: P1-301 —
+// `mode,omitempty` still serialized when set, contradicting the contract.)
 type QuoteRequest struct {
 	Exchange string `json:"exchange"`
 	Symbol   string `json:"symbol"`
-	Mode     string `json:"mode,omitempty"`
+	Mode     string `json:"-"`
 }
 
 // QuoteLTP is a common subset of quote fields when the API returns token/LTP/close style data.
+// (WAVE9-E: P1-196 — REST money is integer paise per
+// https://docs.arrow.trade/go-sdk/market-data/ price scaling; quote["ltp"]
+// is consumed as float64 paise then /100 for rupees. Paise (int64 +
+// UnmarshalJSON) accepts numeric and string shapes without binary-float
+// drift.)
 type QuoteLTP struct {
-	Token int `json:"token"`
-	Ltp   int `json:"ltp"`
-	Close int `json:"close"`
+	Token Paise `json:"token"`
+	Ltp   Paise `json:"ltp"`
+	Close Paise `json:"close"`
 }
 
 // QuoteLTPResponse is the batch quotes API envelope when data is a list of QuoteLTP-like objects.
@@ -47,14 +54,23 @@ type QuoteLTPResponse struct {
 
 // GetQuotes posts to /info/quotes/{mode} with a JSON array of {exchange, symbol} (no mode in body).
 func (c *Client) GetQuotes(instruments []QuoteInstrument, mode InfoQuoteMode) ([]map[string]any, error) {
+	// WAVE9-E (P1-197): nil batch marshals to `null` — short-circuit before
+	// paying for a doomed network call.
+	if len(instruments) == 0 {
+		return []map[string]any{}, nil
+	}
+	// WAVE9-F (P1-300): reject empty exchange/symbol fail-fast instead of
+	// sending a violating body to the API.
+	for i, ins := range instruments {
+		if ins.Exchange == "" || ins.Symbol == "" {
+			return nil, fmt.Errorf("quotes: instrument %d has empty exchange/symbol", i)
+		}
+	}
 	endpoint := fmt.Sprintf("/info/quotes/%s", mode)
-
 	payload, err := json.Marshal(instruments)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to marshal quote requests")
-		return nil, err
+		return nil, fmt.Errorf("quotes: marshal instruments: %w", err)
 	}
-
 	resp, err := c.request(endpoint, "POST", payload)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to fetch quotes")
@@ -80,9 +96,12 @@ func (c *Client) GetQuotes(instruments []QuoteInstrument, mode InfoQuoteMode) ([
 	}
 	var one map[string]any
 	if err := json.Unmarshal(envelope.Data, &one); err == nil && len(one) > 0 {
+		c.debugf("Quotes retrieved successfully", nil)
 		return []map[string]any{one}, nil
 	}
-	return nil, fmt.Errorf("quotes data: unsupported JSON shape")
+	// WAVE9-E (P1-198): include a truncated Data excerpt + Status so an API
+	// contract change is diagnosable instead of opaque.
+	return nil, fmt.Errorf("quotes data: unsupported JSON shape (status=%s, data=%.120s)", envelope.Status, string(envelope.Data))
 }
 
 // GetQuote posts to /info/quote/{mode} with {"symbol","exchange"}.
