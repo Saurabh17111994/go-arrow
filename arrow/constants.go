@@ -39,15 +39,21 @@ const (
 )
 
 // OrderType represents the type of order (limit, market, etc.).
+// R-240: the legacy constants no longer define a second wire encoding — a
+// stop-loss must be sent as one canonical value. The REST-doc encodings
+// (SL-LMT / SL-MKT) are authoritative; OrderTypeSL / OrderTypeSLM alias them
+// and are kept only as deprecated names.
+// Deprecated: use OrderTypeSLLMT / OrderTypeSLMKT.
 type OrderType string
 
 const (
-	OrderTypeLimit   OrderType = "LMT"    // Limit order
-	OrderTypeMarket  OrderType = "MKT"    // Market order
-	OrderTypeSL      OrderType = "SL"     // Stop Loss (legacy)
-	OrderTypeSLM     OrderType = "SL-M"   // Stop Loss Market (legacy)
-	OrderTypeSLLMT   OrderType = "SL-LMT" // Stop Loss Limit (REST docs)
-	OrderTypeSLMKT   OrderType = "SL-MKT" // Stop Loss Market (REST docs)
+	OrderTypeLimit  OrderType = "LMT"    // Limit order
+	OrderTypeMarket OrderType = "MKT"    // Market order
+	OrderTypeSLLMT  OrderType = "SL-LMT" // Stop Loss Limit (REST docs — canonical)
+	OrderTypeSLMKT  OrderType = "SL-MKT" // Stop Loss Market (REST docs — canonical)
+	// Deprecated aliases — same wire value as the canonical constants above.
+	OrderTypeSL  OrderType = "SL-LMT"
+	OrderTypeSLM OrderType = "SL-MKT"
 )
 
 // Validity represents order validity period.
