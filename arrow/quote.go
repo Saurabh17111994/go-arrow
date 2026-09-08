@@ -102,7 +102,9 @@ func (c *Client) GetQuotes(instruments []QuoteInstrument, mode InfoQuoteMode) ([
 		return nil, err
 	}
 	if envelope.Status != "success" {
-		return nil, fmt.Errorf("quotes retrieval failed with status: %s", envelope.Status)
+		// G6: batch path joins the apiError unification (same as GetQuote
+		// single + market.go) — bare status discarded code/message.
+		return nil, apiError("quotes", envelope.Status, resp)
 	}
 
 	// R-201: a `data: null` response (JSON null) previously unmarshalled into a
@@ -156,7 +158,9 @@ func (c *Client) GetQuote(exchange Exchange, symbol string, mode InfoQuoteMode) 
 		return nil, err
 	}
 	if result.Status != "success" {
-		return nil, fmt.Errorf("quote retrieval failed with status: %s", result.Status)
+		// G6: same apiError unification as the batch path + market.go —
+		// the old bare-status error discarded server code/message.
+		return nil, apiError("quote", result.Status, resp)
 	}
 	// R-202: nil data (a `data: null` success) must not be returned as a nil
 	// map with a nil error — follow the package convention and return an
